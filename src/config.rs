@@ -36,6 +36,13 @@ pub type NodeId = u64;
 /// 未指定端口时使用的默认端口。
 pub const DEFAULT_PORT: u16 = 7001;
 
+/// 节点间 RPC 端口相对客户端端口的偏移量。
+///
+/// 沿用 Redis Cluster「集群总线端口」的同一规则（客户端端口 + 10000），
+/// 熟悉 Redis 的运维不需要额外记忆。好处是集群配置里每个节点**只需要写一个地址**，
+/// 节点间通信的地址由它推导而来，不会出现两者写得不一致的情况。
+pub const RPC_PORT_OFFSET: u16 = 10_000;
+
 /// 完整配置。
 ///
 /// 四个分节分别对应：节点自身、集群拓扑、存储、Raft 调参。
@@ -226,6 +233,12 @@ impl Config {
             "cluster.peers 中存在重复的地址",
         )?;
 
+        // 每个节点的 RPC 端口都必须能推导出来，否则那个节点永远连不上
+        self.rpc_listen()?;
+        for peer in &self.cluster.peers {
+            rpc_addr_of(peer.addr)?;
+        }
+
         Ok(())
     }
 
@@ -239,6 +252,43 @@ impl Config {
             .clone()
             .unwrap_or_else(|| default_storage_path(self.node.id))
     }
+
+    /// 本节点用于节点间 RPC 的监听地址。
+    ///
+    /// # 错误
+    ///
+    /// 端口加上 [`RPC_PORT_OFFSET`] 后若超出 `u16` 范围则报错——这种配置若被放行，
+    /// 推导出的地址会静默回绕到一个小端口上，症状是节点之间怎么都连不上，
+    /// 极难排查。
+    pub fn rpc_listen(&self) -> Result<SocketAddr> {
+        rpc_addr_of(self.node.listen)
+    }
+
+    /// 取指定节点的 RPC 地址。
+    ///
+    /// 节点不存在或地址推导失败时返回 `None`。
+    pub fn peer_rpc_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        self.cluster
+            .peers
+            .iter()
+            .find(|peer| peer.id == id)
+            .and_then(|peer| rpc_addr_of(peer.addr).ok())
+    }
+}
+
+/// 由客户端地址推导节点间 RPC 地址。
+fn rpc_addr_of(client: SocketAddr) -> Result<SocketAddr> {
+    client
+        .port()
+        .checked_add(RPC_PORT_OFFSET)
+        .map(|port| SocketAddr::new(client.ip(), port))
+        .ok_or_else(|| {
+            Error::ConfigInvalid(format!(
+                "监听地址 {client} 的端口加上 {RPC_PORT_OFFSET} 后超出了端口范围；\
+                 请改用小于 {} 的端口，否则节点间无法通信",
+                u16::MAX - RPC_PORT_OFFSET
+            ))
+        })
 }
 
 /// 按节点 ID 推导默认数据目录。

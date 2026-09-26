@@ -25,6 +25,8 @@
 //! 全部要求。这是选择 openraft 而非手写 Raft 的核心理由。
 
 pub mod log_store;
+pub mod network;
+pub mod rpc;
 pub mod state_machine;
 pub mod types;
 

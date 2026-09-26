@@ -109,6 +109,17 @@ impl StateMachine {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// 在只读视角下访问内部状态机。
+    ///
+    /// 读路径需要它：状态机被交给了 Raft，但读请求在确认领导权之后可以直接读本地，
+    /// 不必经过共识。因此 [`StateMachine`] 是可克隆的，节点自己保留一份句柄。
+    pub fn read<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Store) -> T,
+    {
+        f(&self.lock().store)
+    }
+
     /// 当前记录数（含已过期但尚未回收的），用于观测。
     pub fn len(&self) -> usize {
         self.lock().store.len()

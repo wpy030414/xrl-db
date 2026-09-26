@@ -66,7 +66,7 @@ async fn run(stream: TcpStream, backend: Arc<Backend>) -> Result<(), FramingErro
         // QUIT 需要先回复 +OK 再断开，因此在这里记下意图
         let should_quit = matches!(command, Command::Quit);
 
-        let reply = backend.execute(command);
+        let reply = backend.execute(command).await;
         framed.send(reply).await?;
 
         if should_quit {

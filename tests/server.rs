@@ -9,40 +9,83 @@
 //! 别忘了「官方 redis-cli 零改造可用」是项目的核心验收标准，这个标准必须由协议字节来背书。
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use xrl_db::backend::Backend;
-use xrl_db::config::Config;
+use xrl_db::config::{Config, RPC_PORT_OFFSET};
+use xrl_db::node::Node;
 use xrl_db::server;
 
 /// 一个测试用的服务实例。
 struct TestServer {
     port: u16,
+    /// 本实例的数据目录。
+    ///
+    /// **必须留住**：`TempDir` 在析构时会删除目录，只保留路径是不够的。
+    /// 同时它也是每个测试实例相互隔离的关键——redb 是单进程的，若多个实例
+    /// 共用一个文件，后启动的会直接报 `DatabaseAlreadyOpen`。
+    _data_dir: tempfile::TempDir,
 }
 
 impl TestServer {
     /// 启动一个监听在空闲端口上的服务。
+    ///
+    /// 每个测试实例都会启动一个真正的单节点 Raft——测试因此覆盖了与生产完全相同的
+    /// 代码路径，而不是一条「专供测试的简化路径」。
     async fn start() -> Self {
-        // 用 `:0` 让操作系统分配空闲端口——固定的测试端口会在并发运行或
-        // 上一次测试残留时发生抢占，那是非常难查的偶发失败。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("应能绑定端口");
-        let port = listener.local_addr().expect("应能取得本地地址").port();
+        loop {
+            // 让操作系统分配一个空闲端口作为客户端端口
+            let Ok(listener) = TcpListener::bind("127.0.0.1:0").await else {
+                continue;
+            };
+            let port = listener.local_addr().expect("应能取得本地地址").port();
 
-        let config = Config::default().resolve().expect("默认配置应合法");
-        let backend = Arc::new(Backend::new(config));
+            // 节点间通信端口由客户端端口推导而来（+10000），两者都必须可用。
+            // 这里只做探测，随即释放——正式绑定由 `Node::start` 完成。
+            let Some(rpc_port) = port.checked_add(RPC_PORT_OFFSET) else {
+                continue;
+            };
+            if std::net::TcpListener::bind(("127.0.0.1", rpc_port)).is_err() {
+                continue;
+            }
 
-        tokio::spawn(async move {
-            // 测试结束时任务随运行时一起被丢弃，因此不关心返回值
-            let _ = server::serve_with(listener, backend).await;
-        });
+            // 每个测试实例一个独立的数据目录
+            let data_dir = tempfile::tempdir().expect("应能创建临时目录");
 
-        Self { port }
+            let mut config = Config::default();
+            config.node.listen = SocketAddr::from(([127, 0, 0, 1], port));
+            config.storage.path = Some(data_dir.path().to_path_buf());
+            let config = config.resolve().expect("默认配置应合法");
+
+            let node = Arc::new(
+                Node::start_single(config.clone())
+                    .await
+                    .expect("应能启动单节点集群"),
+            );
+            // 选举是异步的，等到选出 leader 再开始服务，否则首批写入会撞上
+            // 「还没有 leader」——那会让测试变得随机失败
+            node.wait_for_leader(Duration::from_secs(5))
+                .await
+                .expect("单节点集群应能迅速选出 leader");
+
+            let backend = Arc::new(Backend::new(node, config));
+
+            tokio::spawn(async move {
+                // 测试结束时任务随运行时一起被丢弃，因此不关心返回值
+                let _ = server::serve_with(listener, backend).await;
+            });
+
+            return Self {
+                port,
+                _data_dir: data_dir,
+            };
+        }
     }
 
     /// 建立一条客户端连接。

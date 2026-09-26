@@ -47,6 +47,15 @@ pub enum Error {
         /// 底层 IO 错误。
         source: std::io::Error,
     },
+
+    /// 节点启动或运行失败。
+    ///
+    /// 包装 [`crate::node::NodeError`] 而不是把它拍平成字符串，是为了保留
+    /// openraft / redb 的原始错误类型，便于定位问题。
+    ///
+    /// 装箱是必需的：`NodeError` 里又有一个 `InvalidConfig(Error)` 变体，
+    /// 直接内联会让两个类型互相包含、大小无限。
+    Node(Box<crate::node::NodeError>),
 }
 
 impl fmt::Display for Error {
@@ -75,6 +84,8 @@ impl fmt::Display for Error {
             Error::Bind { addr, source } => {
                 write!(f, "监听地址 {addr} 绑定失败：{source}")
             }
+            // NodeError 自己已经带了完整的上下文，直接透传
+            Error::Node(source) => write!(f, "{source}"),
         }
     }
 }
@@ -85,6 +96,7 @@ impl std::error::Error for Error {
             Error::ConfigRead { source, .. } => Some(source),
             Error::ConfigToml { source, .. } => Some(source),
             Error::Bind { source, .. } => Some(source),
+            Error::Node(source) => Some(source),
             // 无底层错误可追溯的信息性变体
             Error::ConfigLine { .. } | Error::ConfigInvalid(_) => None,
         }
