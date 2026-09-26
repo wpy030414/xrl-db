@@ -32,6 +32,7 @@
 //! | 主节点回复成员变更错误 | 能 | 重试 |
 //! | 请求已发出但超时 / 连接中断 | **不能** | 立即返回「结果未知」 |
 //! | 处理请求的节点在回复前停止 | **不能**——可能已提交但来不及回复 | 立即返回「结果未知」 |
+//! | 本节点失去多数派，提交迟迟不返回 | **不能** | 限时后返回「结果未知」 |
 //!
 //! 最后一行的取舍值得说明：宁可告诉客户端「不知道」，也不能把它伪装成「成功」或
 //! 「失败」。前者会让客户端以为写丢了而重复写，后者会让客户端以为写成了而丢数据。
@@ -53,11 +54,28 @@ use crate::config::Config;
 use crate::kv::WriteOp;
 use crate::protocol::Reply;
 
+/// 本地一次提交的超时。
+///
+/// # 为什么本地也要限时
+///
+/// 主节点在**失去多数派**（比如三节点里两台挂了）之后，`client_write` 会一直等待
+/// 一个不可能到来的多数派确认。实测它不会自己放弃——客户端于是永远收不到回复，
+/// 连接一直挂着。比起一个明确的错误，一个永远不回的请求要糟糕得多：调用方连
+/// 「要不要重试」都无从判断。
+///
+/// 限时之后，这次写入究竟有没有提交就**无法判断**了——它完全可能在我们放弃之后
+/// 才由新的主节点补上。因此超时要归入「结果未知」，而不是「失败」。
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 单次转发的超时。
 ///
 /// 这是**兜底**而非预期值：局域网里一次转发往返只该是毫秒量级。设成秒级是为了
 /// 容忍主节点正忙于把一批日志落盘（`fsync` 是这条路径上的真正瓶颈）。
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// 必须**大于** [`LOCAL_TIMEOUT`]：对端主节点处理这次转发时自己也有一道
+/// [`LOCAL_TIMEOUT`] 的闸门，而它给出的答案（哪怕是「结果未知」）应当来得及
+/// 走完回程。否则我们会先放弃，把一个本可以明确回答的问题变成一个猜。
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 转发的尝试上限。
 ///
@@ -140,10 +158,9 @@ impl fmt::Display for ForwardError {
                 "请求已发往主节点 {leader}，但在收到响应前中断（{reason}）。\
                  这条命令是否已经生效无法确定，请勿在非幂等命令上直接重试"
             ),
-            ForwardError::Unstable { attempts, reason } => write!(
-                f,
-                "连续 {attempts} 次未能联系上主节点（最后一次：{reason}），集群可能正在选举"
-            ),
+            ForwardError::Unstable { attempts, reason } => {
+                write!(f, "连续 {attempts} 次未能完成转发：{reason}")
+            }
             ForwardError::Protocol { reason } => {
                 write!(f, "节点间通信出现协议错误：{reason}")
             }
@@ -215,7 +232,7 @@ impl Forwarder {
                 RpcResponse::ClientWrite(Err(RaftError::APIError(
                     ClientWriteError::ForwardToLeader(hint),
                 ))) => Ok(Outcome::Retryable {
-                    reason: "对方不是主节点".to_string(),
+                    reason: not_leader_reason(hint.leader_id),
                     hint: hint.leader_id,
                 }),
 
@@ -253,7 +270,7 @@ impl Forwarder {
                 RpcResponse::ReadIndex(Err(RaftError::APIError(
                     CheckIsLeaderError::ForwardToLeader(hint),
                 ))) => Ok(Outcome::Retryable {
-                    reason: "对方不是主节点".to_string(),
+                    reason: not_leader_reason(hint.leader_id),
                     hint: hint.leader_id,
                 }),
 
@@ -300,17 +317,17 @@ impl Forwarder {
                 Target::Local
             } else {
                 match hint.take().or_else(|| self.known_leader()) {
-                    Some(leader) if leader != self.self_id => match self.peers.get(&leader) {
-                        Some(addr) => Target::Remote(leader, *addr),
+                    Some(leader) if leader != self.self_id => match self.known_rpc_addr(leader) {
+                        Some(addr) => Target::Remote(leader, addr),
                         None => {
-                            reason = ForwardError::UnknownPeer(leader).to_string();
+                            reason = format!("配置中没有节点 {leader} 的地址");
                             continue;
                         }
                     },
                     // 还不知道主节点是谁，或者缓存的答案就是自己（可能已过期）。
                     // 再等一轮，把新一次的本地尝试留给下一轮循环。
                     _ => {
-                        reason = ForwardError::NoLeader.to_string();
+                        reason = "集群当前没有主节点".to_string();
                         continue;
                     }
                 }
@@ -318,10 +335,28 @@ impl Forwarder {
 
             let (leader, response) = match target {
                 // 本地：与 RPC 服务端共用同一个 dispatch，行为不可能分叉
-                Target::Local => (
-                    self.self_id,
-                    super::rpc::dispatch(&self.raft, build_request()).await,
-                ),
+                Target::Local => {
+                    let request = build_request();
+                    match tokio::time::timeout(
+                        LOCAL_TIMEOUT,
+                        super::rpc::dispatch(&self.raft, request),
+                    )
+                    .await
+                    {
+                        Ok(response) => (self.self_id, response),
+                        // 本地都没能在限时内完成——多半是失去了多数派。
+                        // 它可能稍后才提交，因此只能报「结果未知」。
+                        Err(_elapsed) => {
+                            return Err(ForwardError::OutcomeUnknown {
+                                leader: self.self_id,
+                                reason: format!(
+                                    "本节点在 {LOCAL_TIMEOUT:?} 内未能完成提交，\
+                                     可能已经失去多数派"
+                                ),
+                            });
+                        }
+                    }
+                }
                 Target::Remote(leader, addr) => {
                     match exchange(addr, build_request(), FORWARD_TIMEOUT).await {
                         Ok(response) => (leader, response),
@@ -367,6 +402,25 @@ impl Forwarder {
         self.raft.metrics().borrow().current_leader
     }
 
+    /// 解析一个节点的 RPC 地址。
+    ///
+    /// 与 [`crate::raft::network::NetworkFactory`] 采用完全相同的策略：静态配置优先，
+    /// 配置里没有就退回 Raft 成员信息里的地址。两处必须一致——否则会出现
+    /// 「节点之间能复制日志，客户端的写却转不过去」这种极难解释的现象。
+    fn known_rpc_addr(&self, id: NodeId) -> Option<SocketAddr> {
+        if let Some(addr) = self.peers.get(&id) {
+            return Some(*addr);
+        }
+
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        metrics
+            .membership_config
+            .nodes()
+            .find(|(node_id, _)| **node_id == id)
+            .and_then(|(_, node)| node.addr.parse().ok())
+    }
+
     /// 构造「响应类型与请求不匹配」的错误。
     fn mismatch(&self, what: &str, response: &RpcResponse) -> ForwardError {
         ForwardError::Protocol {
@@ -390,6 +444,22 @@ impl Forwarder {
             leader,
             reason: format!("{who}在处理请求时停止服务：{source}"),
         }
+    }
+}
+
+/// 描述「对方没能处理这次请求」的原因。
+///
+/// `ForwardToLeader` 有两种含义，而它们对运维指向完全不同的故障：
+///
+/// - 带着 leader 提示：对方不是主节点，**但它知道主节点是谁**——换届的正常瞬态。
+/// - 不带提示：**整个集群都没有主节点**。选举正在进行，或者集群已经失去了多数派
+///   （比如三节点里有两台挂了），后一种情况下重试再多次也不会有结果。
+///
+/// 把两者说成同一句话，运维就只能靠猜。
+fn not_leader_reason(hint: Option<NodeId>) -> String {
+    match hint {
+        Some(id) => format!("对方不是主节点（主节点是 {id}）"),
+        None => "集群当前没有主节点（选举进行中，或已失去多数派）".to_string(),
     }
 }
 

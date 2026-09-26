@@ -290,7 +290,11 @@ impl Config {
 }
 
 /// 由客户端地址推导节点间 RPC 地址。
-fn rpc_addr_of(client: SocketAddr) -> Result<SocketAddr> {
+///
+/// 公开是因为运行时新增节点（`RAFT ADD-NODE`）也要做同样的推导：运维给出的
+/// 一定是客户端地址（那是他们唯一知道的地址），而节点间通信要用的是 RPC 地址。
+/// 两处若各写一遍，迟早会推导出不一致的结果。
+pub fn rpc_addr_of(client: SocketAddr) -> Result<SocketAddr> {
     client
         .port()
         .checked_add(RPC_PORT_OFFSET)

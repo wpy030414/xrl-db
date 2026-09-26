@@ -204,6 +204,31 @@ impl TestCluster {
             .await
             .expect("读取应当成功")
     }
+
+    /// 尝试写入，失败时把错误文本带出来而不是 panic。
+    ///
+    /// 与 [`TestCluster::set`] 的区别：那个用于「必须成功」的写入，这个用于
+    /// 「必须失败」的断言。在辅助函数里直接 panic 会把断言本身也一并吞掉。
+    async fn try_set(&self, id: u64, key: &str, value: &str) -> Result<Reply, String> {
+        self.node(id)
+            .write(WriteOp::Set {
+                key: bytes::Bytes::copy_from_slice(key.as_bytes()),
+                value: bytes::Bytes::copy_from_slice(value.as_bytes()),
+                expire_at: None,
+                condition: SetCondition::Always,
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// 尝试读取，失败时把错误文本带出来而不是 panic。
+    async fn try_get(&self, id: u64, key: &str) -> Result<Reply, String> {
+        let key = bytes::Bytes::copy_from_slice(key.as_bytes());
+        self.node(id)
+            .read(move |store| store.get(&key, xrl_db::kv::now_ms()))
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// 为 `count` 个节点各找一对可用端口。
@@ -498,6 +523,83 @@ async fn forwarding_survives_a_leader_change() {
         cluster.get(new_leader, "before").await,
         Reply::Bulk(bytes::Bytes::from_static(b"1"))
     );
+}
+
+// ============================================================ 失去多数派
+//
+// 这一组验证 CP 语义：「分区时拒绝写入」不是一句口号，而是可观测的行为。
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_minority_refuses_writes_and_never_hangs() {
+    // ★ 这条测试锁定的是一个真实修复过的缺陷 ★
+    //
+    // 孤立的主节点（失去多数派之后）调用 `client_write` 会一直等待一个不可能到来的
+    // 多数派确认，**永远不会返回**——客户端于是永远收不到回复，连接一直挂着。
+    // 比起一个明确的错误，一个永不返回的请求要糟糕得多：调用方连「要不要重试」
+    // 都无从判断。
+    //
+    // 所以这里既断言「拒绝」，也断言「在有限时间内拒绝」。
+    let mut cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+
+    // 先写一个键，确认多数派正常时一切照常
+    cluster.set(leader, "before-partition", "1").await;
+
+    // 干掉两个节点，只留一个——无论它是不是主节点，都不再构成多数派
+    let doomed: Vec<u64> = (1..=CLUSTER_SIZE).filter(|id| *id != leader).collect();
+    for id in &doomed {
+        cluster.kill(*id).await;
+    }
+    assert_eq!(survivors(&cluster), 1, "只剩一个节点，已经没有多数派");
+
+    // 此时无论连到幸存者的是写还是读，都必须得到一个错误，而且必须**及时**得到
+    for attempt in 0..3 {
+        let outcome = tokio::time::timeout(
+            MAJORITY_LOST_TIMEOUT,
+            cluster.try_set(leader, "should-not-land", "x"),
+        )
+        .await;
+
+        match outcome {
+            // 外面的超时先触发，说明请求挂住了——这正是要防的那个缺陷
+            Err(_elapsed) => panic!(
+                "失去多数派之后，第 {attempt} 次写入在 {MAJORITY_LOST_TIMEOUT:?} 内没有返回。\
+                 请求挂起比返回错误糟糕得多：调用方无从判断该不该重试。"
+            ),
+            Ok(Ok(reply)) => panic!(
+                "失去多数派之后写入竟然成功了（返回 {reply:?}）。\
+                 这是脑裂的前兆：少数派必须拒绝写入。"
+            ),
+            Ok(Err(message)) => {
+                assert!(
+                    !message.is_empty(),
+                    "拒绝写入时必须说明原因，实际是一条空错误"
+                );
+            }
+        }
+    }
+
+    // 读同样必须被拒绝：无法确认时效性的读等于返回可能过期的数据
+    let read = tokio::time::timeout(
+        MAJORITY_LOST_TIMEOUT,
+        cluster.try_get(leader, "before-partition"),
+    )
+    .await
+    .expect("失去多数派之后的读取也必须及时返回")
+    .expect_err("失去多数派之后读取必须被拒绝，而不是返回可能过期的值");
+
+    assert!(!read.is_empty(), "拒绝读取时必须说明原因，实际是一条空错误");
+}
+
+/// 等待「失去多数派之后」的操作返回的上限。
+///
+/// 给得比 `LOCAL_TIMEOUT` 宽松得多：这里要证明的是「不会永远挂住」，
+/// 而不是「多快返回」。
+const MAJORITY_LOST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 统计还活着的节点数。
+fn survivors(cluster: &TestCluster) -> usize {
+    cluster.nodes.iter().filter(|node| node.is_some()).count()
 }
 
 /// 等待一个**排除指定节点后**的集群选出主节点。

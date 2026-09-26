@@ -422,6 +422,35 @@ impl Node {
         Ok(())
     }
 
+    /// 把一个节点纳入集群：先作为学习者追平数据，再转为投票成员。
+    ///
+    /// 两步的顺序不能反。直接把它设为投票成员，就是让一个还没有任何数据的节点
+    /// 立刻参与多数派计算——集群规模变大了，可用性却不升反降。
+    ///
+    /// **只应由主节点调用**。本节点不是主节点时，底层的调用会返回错误，错误信息
+    /// 里带着真正的主节点是谁。
+    ///
+    /// 幂等：已经在该节点集合里时直接返回成功，不重复提交成员变更。
+    pub async fn add_member(&self, id: NodeId, node: BasicNode) -> Result<(), NodeError> {
+        let membership = self.metrics().membership_config;
+
+        let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+        if voters.contains(&id) {
+            return Ok(());
+        }
+
+        // 已经作为学习者存在时不必重复登记——`add_learner` 会重新走一遍
+        // 「等待追平」的流程，在重试场景下白白拖延。
+        let known = membership.nodes().any(|(node_id, _)| *node_id == id);
+        if !known {
+            self.add_learner(id, node).await?;
+        }
+
+        let mut next = voters;
+        next.insert(id);
+        self.change_membership(next).await
+    }
+
     /// 关闭本节点。
     ///
     /// 取 `&self` 而非 `self`，是为了让调用方不必从 `Arc` 里解包——`Raft` 句柄

@@ -63,6 +63,20 @@ impl Reply {
         Reply::Simple("OK".to_string())
     }
 
+    /// 构造一条简单字符串响应。
+    ///
+    /// 简单字符串**不能包含 CRLF**——它是行式的，一旦含有换行就会把字节流
+    /// 拆成两条回复，客户端从此错位。因此这里显式挡掉，而不是等到线上才发现。
+    /// 需要携带换行的文本请改用 [`Reply::bulk`]。
+    pub fn simple(text: impl Into<String>) -> Self {
+        let text = text.into();
+        debug_assert!(
+            !text.contains('\r') && !text.contains('\n'),
+            "简单字符串中不能出现换行：{text}"
+        );
+        Reply::Simple(text)
+    }
+
     /// 构造一条错误响应。
     ///
     /// 传入的文本应遵循 Redis 惯例（以 `ERR` / `WRONGTYPE` 等错误码开头）。

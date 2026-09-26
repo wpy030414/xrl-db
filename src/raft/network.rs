@@ -214,10 +214,22 @@ impl NetworkFactory {
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = Network;
 
-    async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
-        Network {
-            target,
-            addr: self.members.get(&target).copied(),
-        }
+    /// 为一个对端节点创建连接描述。
+    ///
+    /// 地址优先取自**静态配置**，取不到时退回 openraft 成员信息里携带的地址。
+    /// 后者是运行时通过 `RAFT ADD-NODE` 加进来的节点唯一可能的来源——那时
+    /// 配置文件里根本没有它，若不做这个回退，新节点会被加进成员集合却永远
+    /// 连不上，表现为「加进去了但一直是 learner」。
+    ///
+    /// 配置优先是刻意的：静态配置是运维显式写下的意图，成员信息则可能来自
+    /// 某次运行时操作。两者不一致时，以配置为准更容易解释。
+    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+        let addr = self
+            .members
+            .get(&target)
+            .copied()
+            .or_else(|| node.addr.parse().ok());
+
+        Network { target, addr }
     }
 }

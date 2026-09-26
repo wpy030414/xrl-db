@@ -56,6 +56,19 @@ pub enum Error {
     /// 装箱是必需的：`NodeError` 里又有一个 `InvalidConfig(Error)` 变体，
     /// 直接内联会让两个类型互相包含、大小无限。
     Node(Box<crate::node::NodeError>),
+
+    /// 组建集群时，某个配置里写明的节点始终无法纳入。
+    ///
+    /// 单独作为一个变体而不是塞进 [`Error::Node`]，是因为它描述的**不是**本节点的
+    /// 故障，而是集群拓扑没能按配置建成——排查方向完全不同。
+    Bootstrap {
+        /// 未能纳入的节点 ID。
+        id: u64,
+        /// 该节点在配置里的地址。
+        addr: String,
+        /// 失败原因。
+        source: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -86,6 +99,12 @@ impl fmt::Display for Error {
             }
             // NodeError 自己已经带了完整的上下文，直接透传
             Error::Node(source) => write!(f, "{source}"),
+            Error::Bootstrap { id, addr, source } => write!(
+                f,
+                "无法把节点 {id}（{addr}）纳入集群：{source}。\
+                 该节点没有启动、地址写错了，或者它监听的不是这个地址。\
+                 集群未按配置建成，本节点已停止启动"
+            ),
         }
     }
 }
@@ -98,7 +117,7 @@ impl std::error::Error for Error {
             Error::Bind { source, .. } => Some(source),
             Error::Node(source) => Some(source),
             // 无底层错误可追溯的信息性变体
-            Error::ConfigLine { .. } | Error::ConfigInvalid(_) => None,
+            Error::ConfigLine { .. } | Error::ConfigInvalid(_) | Error::Bootstrap { .. } => None,
         }
     }
 }

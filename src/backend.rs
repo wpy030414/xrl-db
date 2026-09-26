@@ -80,10 +80,8 @@ impl Backend {
             Command::ClusterInfo => return self.cluster_info_reply(),
             Command::RaftLeader => return self.raft_leader_reply(),
             Command::RaftInfo => return self.raft_info_reply(),
-            Command::RaftAddNode { .. } => {
-                return Reply::error(
-                    "ERR RAFT ADD-NODE requires an explicit membership change flow, which is not exposed over the client protocol yet",
-                );
+            Command::RaftAddNode { id, addr } => {
+                return self.raft_add_node(*id, addr).await;
             }
             _ => {}
         }
@@ -170,6 +168,15 @@ impl Backend {
             "replica"
         }
     }
+    /// 当前实际参与投票的节点数。
+    ///
+    /// 取的是 Raft 的成员集合，而不是配置里写了几个节点——配置是**意图**，
+    /// 成员集合才是**事实**。两者在「改了配置但还没做成员变更」时会不一致，
+    /// 脚本据此判断集群规模时必须拿到事实。
+    fn voter_count(&self) -> usize {
+        self.node.metrics().membership_config.voter_ids().count()
+    }
+
     /// `CLUSTER INFO`
     ///
     /// 注意 `cluster_enabled` 恒为 `0`：Redis 客户端看到它为 `1` 会启用**槽位路由**
@@ -196,9 +203,55 @@ impl Backend {
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             metrics.vote.leader_id().term,
-            self.config.cluster.peers.len().max(1),
+            self.voter_count().max(1),
         );
         Reply::Bulk(bytes::Bytes::from(body))
+    }
+
+    /// `RAFT ADD-NODE <id> <客户端地址>`：把一个节点纳入集群。
+    ///
+    /// # 两步走，顺序不能反
+    ///
+    /// 先作为**学习者**加入，等它追平已有数据，再转为**投票成员**。反过来做，
+    /// 就是让一个还没有任何数据的节点立刻参与多数派计算：三节点集群里加入第四个
+    /// 节点后，多数派需要其中任意三个响应，而新节点连日志都还没拿到——集群的
+    /// 可用性不升反降。
+    ///
+    /// # 为什么不做自动转发
+    ///
+    /// 成员变更是低频的运维操作，而「变更到底提交到了哪个节点上」这件事值得让
+    /// 运维自己清楚。本节点不是主节点时，错误信息会直接告诉他要去找谁。
+    ///
+    /// # 地址为什么只给客户端地址
+    ///
+    /// 运维唯一知道的地址就是客户端地址。节点间通信用的 RPC 地址由它推导而来
+    /// （见 [`crate::config::RPC_PORT_OFFSET`]），两处共用同一个推导函数，
+    /// 不会出现「脚本里写的是一个端口、集群里用的是另一个」这种错位。
+    async fn raft_add_node(&self, id: crate::config::NodeId, client_addr: &str) -> Reply {
+        let Ok(client_addr) = client_addr.parse::<std::net::SocketAddr>() else {
+            return Reply::error(format!(
+                "ERR RAFT ADD-NODE 的地址 `{client_addr}` 无法解析，\
+                 应当形如 127.0.0.1:7003"
+            ));
+        };
+
+        let rpc_addr = match crate::config::rpc_addr_of(client_addr) {
+            Ok(addr) => addr,
+            Err(error) => return Reply::error(format!("ERR {error}")),
+        };
+
+        // 学习者用 **RPC 地址**登记：主节点之后要主动连它推送日志，而它未必出现在
+        // 各个节点的静态配置里（见 `NetworkFactory::new_client` 的回退说明）。
+        let member = openraft::impls::BasicNode::new(rpc_addr.to_string());
+
+        match self.node.add_member(id, member).await {
+            Ok(()) => Reply::simple(format!(
+                "OK 节点 {id}（客户端 {client_addr}，节点间 {rpc_addr}）已加入，\
+                 当前投票成员 {} 个",
+                self.voter_count()
+            )),
+            Err(error) => Reply::error(format!("ERR 节点 {id} 加入失败：{error}")),
+        }
     }
 
     /// `RAFT LEADER`
@@ -213,6 +266,25 @@ impl Backend {
     /// `RAFT INFO`
     fn raft_info_reply(&self) -> Reply {
         let metrics = self.node.metrics();
+
+        // 成员集合以 **Raft 的实际状态**为准，而不是配置里写了几个节点。
+        // 两者在「已经改过配置但还没做成员变更」时会不一致，此时运维需要知道的是
+        // 集群**实际**由谁在投票——配置只是意图，成员集合才是事实。
+        let voters: std::collections::BTreeSet<u64> =
+            metrics.membership_config.voter_ids().collect();
+
+        let learners = metrics
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| !voters.contains(id))
+            .count();
+
+        let voter_list = voters
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
         Reply::Map(vec![
             (Reply::bulk("mode"), Reply::bulk(self.mode_name())),
             (
@@ -245,10 +317,9 @@ impl Backend {
                     None => Reply::Null,
                 },
             ),
-            (
-                Reply::bulk("members"),
-                Reply::Integer(self.config.cluster.peers.len().max(1) as i64),
-            ),
+            (Reply::bulk("members"), Reply::Integer(voters.len() as i64)),
+            (Reply::bulk("voters"), Reply::bulk(voter_list)),
+            (Reply::bulk("learners"), Reply::Integer(learners as i64)),
         ])
     }
 
@@ -320,7 +391,7 @@ impl Backend {
         if wants("cluster") {
             out.push_str(&format!(
                 "\r\n# Cluster\r\ncluster_enabled:0\r\nxrldb_members:{}\r\n",
-                self.config.cluster.peers.len().max(1)
+                self.voter_count().max(1)
             ));
         }
 
