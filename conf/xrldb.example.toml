@@ -1,0 +1,31 @@
+# XRLDB 示例配置（TOML 格式）
+#
+# 这是三节点集群中「节点 1」的配置。节点 2、3 只需改动
+# node.id、node.listen、storage.path 三处。
+#
+# 与 conf/redis.example.conf 语义完全等价，仅格式不同——
+# 两种格式解析后归一到同一个配置结构，可用任意一种。
+
+[node]
+id = 1
+# 默认只监听回环地址。对外提供服务必须显式改成 0.0.0.0 或具体网卡地址。
+listen = "127.0.0.1:7001"
+
+[cluster]
+enabled = true
+# 必须列出集群内全部节点，包含本节点自己。
+peers = [
+  { id = 1, addr = "127.0.0.1:7001" },
+  { id = 2, addr = "127.0.0.1:7002" },
+  { id = 3, addr = "127.0.0.1:7003" },
+]
+
+[storage]
+# 每个节点必须使用独立目录。redb 是单进程的，共用文件会导致后启动的节点打不开。
+path = "./data/node-1"
+
+[raft]
+# 选举超时必须至少是心跳间隔的 2 倍，否则 follower 会在收到心跳前超时，
+# 集群将陷入持续选举而无法稳定产生 leader。
+election_timeout_ms = 300
+heartbeat_interval_ms = 100
