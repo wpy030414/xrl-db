@@ -257,6 +257,10 @@ impl Decoder for RespCodec {
 
         // 两个分支返回的帧类型不同，因此各自取到后就地归一为 RESP3 帧；
         // 半包（数据未到齐）则返回 None，等下次调用再继续。
+        //
+        // 这里**不**对解码错误做「是不是其实没发全」的猜测：首字节落在类型前缀
+        // 集合里时，字节流的形态已经完全确定，解码器的判断是可信的。详见
+        // `the_first_byte_decides_between_frame_and_inline` 那条测试。
         let normalized: Resp3Frame = match &mut self.inner {
             Inner::Resp2(codec) => match codec.decode(src)? {
                 Some(frame) => resp2_to_resp3(frame),
@@ -362,6 +366,54 @@ mod tests {
         let mut out = BytesMut::new();
         codec.encode(Reply::Null, &mut out).expect("编码不应失败");
         assert_eq!(out.to_vec(), b"_\r\n", "切换后应使用 RESP3 编码");
+    }
+
+    #[test]
+    fn the_first_byte_decides_between_frame_and_inline() {
+        // 首字节落在 RESP 类型前缀集合里时，一律按 RESP 帧处理，**不做内联解释**。
+        //
+        // 这是刻意的，也是 Redis 的做法：`*` 既可能是一条数组命令的开头，也可能被
+        // 某个 telnet 用户当成内联命令的第一个字符，两者无法从字节上区分，必须有
+        // 一方优先。先认帧的代价是「以类型前缀开头的内联命令不可用」——而后者在
+        // 实践中不存在，命令名总是字母。
+        //
+        // 两种方言下的处置不同，但都是诚实的，因为它们面对的是不同的语法：
+        //   RESP2 —— `_` 不是合法帧类型，这串字节永远不可能变得合法，因此**立刻**
+        //            报帧层面错误，比无限等待更有信息量；
+        //   RESP3 —— `_\r\n` 是合法的 Null 帧，于是走到命令层面：回一句错误、
+        //            连接保持可用。
+        //
+        // 把这条规则连同它的不对称写成测试，是为了下一个人（包括我自己）在
+        // 看到这个差异时，先读到「它是不是有意的」，再决定要不要动手改。
+        let mut resp2 = RespCodec::new(Dialect::Resp2);
+        let mut buffer = BytesMut::from(&b"_\r\n"[..]);
+        assert!(
+            resp2.decode(&mut buffer).is_err(),
+            "RESP2 下 `_` 不是合法帧类型，应当报帧层面错误而不是等待"
+        );
+
+        let mut resp3 = RespCodec::new(Dialect::Resp3);
+        let mut buffer = BytesMut::from(&b"_\r\n"[..]);
+        assert_eq!(
+            resp3
+                .decode(&mut buffer)
+                .expect("RESP3 下这是合法的 Null 帧，不该是帧层面错误"),
+            Some(Err(CommandError::NotACommand)),
+            "RESP3 下 `_` 是合法的 Null 帧，应当走到命令层面而不是断连"
+        );
+
+        // 完整的数组命令在任何方言下都不会被误判成内联
+        for dialect in [Dialect::Resp2, Dialect::Resp3] {
+            let mut codec = RespCodec::new(dialect);
+            let mut buffer = array_command(&["PING"]);
+            assert!(
+                matches!(
+                    codec.decode(&mut buffer),
+                    Ok(Some(Ok(Command::Ping { .. })))
+                ),
+                "{dialect:?} 下数组命令应当被正常解出"
+            );
+        }
     }
 
     #[test]
