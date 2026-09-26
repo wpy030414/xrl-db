@@ -39,6 +39,14 @@ pub enum Error {
 
     /// 配置在语义上不合法——语法正确，但各项组合起来说不通。
     ConfigInvalid(String),
+
+    /// 监听地址绑定失败（端口被占用、地址不可用、权限不足等）。
+    Bind {
+        /// 尝试绑定的地址。
+        addr: std::net::SocketAddr,
+        /// 底层 IO 错误。
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for Error {
@@ -64,6 +72,9 @@ impl fmt::Display for Error {
             Error::ConfigInvalid(message) => {
                 write!(f, "配置校验失败：{message}")
             }
+            Error::Bind { addr, source } => {
+                write!(f, "监听地址 {addr} 绑定失败：{source}")
+            }
         }
     }
 }
@@ -73,7 +84,8 @@ impl std::error::Error for Error {
         match self {
             Error::ConfigRead { source, .. } => Some(source),
             Error::ConfigToml { source, .. } => Some(source),
-            // 后两者是我们自己构造的信息性错误，没有底层错误可追溯
+            Error::Bind { source, .. } => Some(source),
+            // 无底层错误可追溯的信息性变体
             Error::ConfigLine { .. } | Error::ConfigInvalid(_) => None,
         }
     }

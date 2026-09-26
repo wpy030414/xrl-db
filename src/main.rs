@@ -1,10 +1,10 @@
 //! XRLDB 进程入口。
 //!
-//! 职责：解析命令行参数 → 加载配置 → （后续阶段）启动节点。
+//! 职责：解析命令行参数 → 加载并校验配置 → 启动节点。
 //!
 //! 配置优先级：**CLI 参数 > 环境变量 > 配置文件 > 内置默认值**。
 //! 前两者由 clap 统一处理（见 [`Cli`] 各字段的 `env` 属性），后两者由
-//! [`Config`] 负责。
+//! [`xrl_db::config::Config`] 负责。
 
 use std::path::PathBuf;
 
@@ -30,63 +30,49 @@ struct Cli {
     /// 覆盖配置中的节点 ID。
     #[arg(long, value_name = "N", env = "XRLDB_NODE_ID")]
     node_id: Option<u64>,
+
+    /// 只校验配置并退出，不启动服务。
+    ///
+    /// 供部署脚本在正式启动前先行检查，避免配置错误要到服务启动时才暴露。
+    #[arg(long)]
+    check: bool,
 }
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(err) = run().await {
         // 错误走 stderr 且退出码非零——脚本据此判断启动是否成功
         eprintln!("错误：{err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let config = resolve_config(&cli)?;
 
-    let mut cfg = match &cli.config {
+    if cli.check {
+        println!("配置校验通过。");
+        return Ok(());
+    }
+
+    xrl_db::node::run(config).await
+}
+
+/// 按优先级合并各来源，得到最终配置。
+fn resolve_config(cli: &Cli) -> Result<Config> {
+    let mut config = match &cli.config {
         Some(path) => Config::from_file(path)?,
         None => Config::default(),
     };
 
     // CLI 与环境变量的覆盖优先于配置文件
     if let Some(listen) = cli.listen {
-        cfg.node.listen = listen;
+        config.node.listen = listen;
     }
     if let Some(node_id) = cli.node_id {
-        cfg.node.id = node_id;
+        config.node.id = node_id;
     }
 
-    let cfg = cfg.resolve()?;
-    print_summary(&cfg);
-
-    Ok(())
-}
-
-/// 打印解析后的配置摘要。
-fn print_summary(cfg: &Config) {
-    println!("XRLDB 节点 {}", cfg.node.id);
-    println!("  监听地址  {}", cfg.node.listen);
-    println!("  数据目录  {}", cfg.storage_path().display());
-
-    if cfg.cluster.enabled {
-        println!("  集群模式  已启用，共 {} 个节点", cfg.cluster.peers.len());
-        for peer in &cfg.cluster.peers {
-            let marker = if peer.id == cfg.node.id {
-                "  ← 本节点"
-            } else {
-                ""
-            };
-            println!("            - 节点 {} @ {}{}", peer.id, peer.addr, marker);
-        }
-    } else {
-        println!("  集群模式  未启用（单节点）");
-    }
-
-    println!(
-        "  Raft      选举超时 {}ms，心跳间隔 {}ms",
-        cfg.raft.election_timeout_ms, cfg.raft.heartbeat_interval_ms
-    );
-    println!();
-    // 如实说明当前进度，避免让人误以为已经能提供服务
-    println!("注意：网络服务尚未实现，当前仅验证配置解析链路。");
+    config.resolve()
 }

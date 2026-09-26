@@ -40,14 +40,6 @@ cargo build --release
 cargo run --release -- --config xrldb.toml
 ```
 
-### 运行三节点集群
-
-```bash
-./scripts/cluster-up.sh      # 拉起三个节点
-./scripts/verify-cluster.sh  # 验证故障转移后数据不丢
-./scripts/cluster-down.sh    # 停止集群
-```
-
 ### 用 Redis 客户端连接
 
 ```bash
@@ -58,15 +50,46 @@ OK
 "bar"
 ```
 
+### 运行三节点集群
+
+**尚未可用。** 集群配置能够被加载与校验，但共识层还没有接入——节点之间不通信，也不提供强一致性。
+启停与故障验证脚本会随共识层一同提供。
+
 ## 当前状态
 
 - **阶段**：原型开发中
-- **已实现**：*（随开发进度更新）*
-- **已知限制**：
-  - 尚未支持分片；集群为单 Raft 组，数据量受单机内存限制
-  - 尚未支持 AUTH，默认只监听 `127.0.0.1`
-  - 仅支持 String 类型命令；Hash / List / Set / ZSet 尚未实现
-  - `CONFIG GET/SET/REWRITE` 尚未实现
+
+### 已可用
+
+- **协议兼容**：RESP2 与 RESP3 双方言（含 `HELLO` 协商与内联命令），官方 `redis-cli` 零改造直连
+- **数据模型**：String 类型 + TTL（惰性过期）
+- **配置**：TOML 与 `redis.conf` 双格式，解析后归一
+- **服务**：多连接并发，状态机读写分离
+
+已支持的命令：
+
+```
+连接:   PING  ECHO  QUIT  HELLO
+字符串: GET  SET（含 EX/PX/EXAT/PXAT/NX/XX/KEEPTTL）
+        DEL  EXISTS  MSET  MGET  APPEND  STRLEN
+        INCR  DECR  INCRBY  DECRBY
+键管理: EXPIRE  TTL  PERSIST  KEYS  SCAN  TYPE
+服务器: INFO  DBSIZE  FLUSHDB
+集群:   CLUSTER INFO
+        RAFT LEADER / RAFT INFO
+```
+
+尚未支持的命令会返回规范的 Redis 错误，而非静默失败或断开连接。
+
+### 已知限制
+
+- **共识层尚未接入**：这是当前最大的缺口。集群配置可以加载，但节点之间不通信，**不提供强一致性**——即项目最核心的那个卖点还没有兑现
+- **数据不落盘**：纯内存实现，进程退出即丢失。持久化随共识层一同引入
+- 尚未支持分片；数据量受单机内存限制
+- 仅支持 String 类型；Hash / List / Set / ZSet 尚未实现
+- 未实现 AUTH，默认只监听 `127.0.0.1`
+- `CONFIG GET/SET/REWRITE` 未实现
+- 无连接数上限与空闲超时
 
 ## 核心技术
 

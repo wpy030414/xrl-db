@@ -45,6 +45,12 @@ pub enum Reply {
     Null,
     /// 数组，元素递归编码
     Array(Vec<Reply>),
+    /// 映射。
+    ///
+    /// RESP3 有原生映射类型，RESP2 没有——后者用扁平数组 `[k1, v1, k2, v2, ...]` 表达，
+    /// 这也是 Redis 自身的惯例（`CONFIG GET`、`HELLO` 的回复都是这个形状）。
+    /// 又一个必须区分方言的地方。
+    Map(Vec<(Reply, Reply)>),
 }
 
 impl Reply {
@@ -78,6 +84,15 @@ impl Reply {
             Reply::Array(items) => {
                 Resp2Frame::Array(items.into_iter().map(Reply::into_resp2).collect())
             }
+            Reply::Map(pairs) => {
+                // RESP2 没有映射类型，展开成交替的键值序列
+                let mut flat = Vec::with_capacity(pairs.len() * 2);
+                for (key, value) in pairs {
+                    flat.push(key.into_resp2());
+                    flat.push(value.into_resp2());
+                }
+                Resp2Frame::Array(flat)
+            }
         }
     }
 
@@ -106,6 +121,16 @@ impl Reply {
                 data: items.into_iter().map(Reply::into_resp3).collect(),
                 attributes: None,
             },
+            Reply::Map(pairs) => {
+                let mut data = std::collections::HashMap::with_capacity(pairs.len());
+                for (key, value) in pairs {
+                    data.insert(key.into_resp3(), value.into_resp3());
+                }
+                Resp3Frame::Map {
+                    data,
+                    attributes: None,
+                }
+            }
         }
     }
 }
@@ -205,6 +230,28 @@ mod tests {
         assert_ne!(
             encode(Reply::Array(vec![]), Dialect::Resp2),
             encode(Reply::Null, Dialect::Resp2)
+        );
+    }
+
+    #[test]
+    fn map_uses_native_type_in_resp3_and_flat_array_in_resp2() {
+        let reply = Reply::Map(vec![
+            (Reply::bulk("proto"), Reply::Integer(3)),
+            (Reply::bulk("mode"), Reply::bulk("standalone")),
+        ]);
+
+        // RESP3：原生映射类型，以 `%2` 开头（2 个键值对）
+        let resp3 = encode(reply.clone(), Dialect::Resp3);
+        assert!(
+            resp3.starts_with(b"%2\r\n"),
+            "RESP3 应使用原生映射，实际为：{resp3:?}"
+        );
+
+        // RESP2：没有映射类型，展开为扁平数组，`*4`（2 对 = 4 个元素）
+        let resp2 = encode(reply, Dialect::Resp2);
+        assert!(
+            resp2.starts_with(b"*4\r\n"),
+            "RESP2 应展开为扁平数组，实际为：{resp2:?}"
         );
     }
 }

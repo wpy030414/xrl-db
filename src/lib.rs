@@ -6,6 +6,13 @@
 //! 当前处于原型开发阶段，架构为「单 Raft 组」。详见 `docs/PRD.md` 与
 //! `docs/ARCHITECTURE.md`。
 
+pub mod backend;
 pub mod config;
 pub mod error;
+pub mod kv;
+pub mod node;
 pub mod protocol;
+pub mod server;
+
+/// 本服务的版本号，取自 `Cargo.toml`。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
