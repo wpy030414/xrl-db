@@ -21,9 +21,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+mod common;
+
 use bytes::Bytes;
 
-use xrl_db::config::{Config, RPC_PORT_OFFSET};
+use xrl_db::config::{Config, RaftConfig};
 use xrl_db::kv::WriteOp;
 use xrl_db::node::Node;
 use xrl_db::protocol::{Reply, SetCondition};
@@ -58,8 +60,11 @@ struct TestNode {
 impl TestNode {
     async fn start() -> Self {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
-        let port = free_port().await;
-        let config = build_config(port, dir.path().to_path_buf());
+        let port = common::free_port().await;
+        let config = snapshot_config(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            dir.path().to_path_buf(),
+        );
 
         let node = start_node(config.clone()).await;
 
@@ -126,43 +131,18 @@ fn set_op(index: u64) -> WriteOp {
     }
 }
 
-/// 找一个客户端端口可用、且 `+ 10000` 的节点间通信端口也可用的端口。
-async fn free_port() -> u16 {
-    loop {
-        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
-            continue;
-        };
-        let port = listener.local_addr().expect("应能取得地址").port();
-        drop(listener);
-
-        let Some(rpc_port) = port.checked_add(RPC_PORT_OFFSET) else {
-            continue;
-        };
-        if std::net::TcpListener::bind(("127.0.0.1", rpc_port)).is_ok() {
-            return port;
-        }
-    }
-}
-
-fn build_config(port: u16, data_dir: std::path::PathBuf) -> Config {
-    let config = Config {
-        node: xrl_db::config::NodeConfig {
-            id: 1,
-            listen: SocketAddr::from(([127, 0, 0, 1], port)),
-        },
-        storage: xrl_db::config::StorageConfig {
-            path: Some(data_dir),
-        },
-        raft: xrl_db::config::RaftConfig {
-            election_timeout_ms: 300,
-            heartbeat_interval_ms: 100,
-            snapshot_logs_since_last: SNAPSHOT_EVERY,
-            max_in_snapshot_log_to_keep: KEEP_LOGS,
-        },
-        ..Default::default()
+/// 单机配置 + 刻意调小的快照间隔。
+///
+/// 快照策略只是让快照来得早一点，不影响被测逻辑——默认每 5000 条才快照一次，
+/// 意味着这个测试要写几千个键，慢到没人愿意跑。
+fn snapshot_config(listen: SocketAddr, data_dir: std::path::PathBuf) -> Config {
+    let raft = RaftConfig {
+        snapshot_logs_since_last: SNAPSHOT_EVERY,
+        max_in_snapshot_log_to_keep: KEEP_LOGS,
+        ..common::test_raft_config()
     };
 
-    config.resolve().expect("测试配置应合法")
+    common::single_config(1, listen, data_dir, raft)
 }
 
 /// 启动一个单节点集群并等它选出主节点。

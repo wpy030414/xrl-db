@@ -570,8 +570,20 @@ fn build_raft_config(config: &Config) -> RaftConfig {
         // 因此「多久建一次快照」实际上就是「日志能占多大磁盘」。
         snapshot_policy: SnapshotPolicy::LogsSinceLast(raft.snapshot_logs_since_last),
         max_in_snapshot_log_to_keep: raft.max_in_snapshot_log_to_keep,
-        // 每次最多删一条。批量删看起来更快，但删除发生在提交路径上——
-        // 一次删一大批会让某次写入的延迟突然多出几十毫秒。平滑更重要。
+        // 这个字段的名字极易读反：它不是「一次删多少条」，而是「积压到多少条才开始删」。
+        //
+        // openraft 只在**快照建好之后**回头算一次（`schedule_policy_based_purge`），
+        // 而 `calc_purge_upto` 返回的是删除**终点**——一次 `purge()` 会把积压到那一刻
+        // 的日志一并删掉（我们这边的实现是一次 `retain_in` 范围删除，一个事务）。
+        // 所以真正决定批量大小的不是这个数字，而是「两次快照之间积累了多少条日志」。
+        //
+        // 这带来一个不留神就会踩的坑：**取值不能大于两次快照之间积累的日志量**，
+        // 否则阈值永远达不到，日志只增不减。实测把这里调成 10000、快照间隔仍是 20 时，
+        // `purged` 从头到尾都是 0——截断彻底失效，而且不报任何错。
+        //
+        // 取 1 的含义是「快照一建好就立刻清理」，日志留存因此最短（约等于
+        // snapshot_logs_since_last + max_in_snapshot_log_to_keep）。这是想要的效果：
+        // 清理得越早，磁盘占用越小，而清理频率仍然是一次快照一次，与写入量无关。
         purge_batch_size: 1,
         replication_lag_threshold,
 

@@ -83,10 +83,14 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(8);
 /// 至多是 `MAX_ATTEMPTS - 1`。留出几次是为了容忍「主节点刚刚换届」这种瞬态。
 const MAX_ATTEMPTS: usize = 4;
 
-/// 两次尝试之间的间隔。
+/// 两次尝试之间的间隔——**仅在上一次尝试没能送达到可用目标时才用**。
 ///
 /// 存在的意义是给选举留出时间：客户端恰好在换届瞬间发来请求时，短暂等待远好过
 /// 立刻甩一个错误回去。几轮加起来约 600 毫秒，覆盖一次正常的选举。
+///
+/// 它**不**用于「跟着主节点提示去转发」那一步。那一步是确定要做的，等它只是在
+/// 白白增加延迟——而它恰恰是从节点上的每一次读写都要走的一步。何时退避由
+/// [`Forwarder::with_leader`] 里的 `backoff` 决定。
 const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// 转发过程中可能出现的失败。
@@ -306,8 +310,24 @@ impl Forwarder {
         let mut reason = "尚未开始".to_string();
         let mut hint: Option<NodeId> = None;
 
+        // 本次尝试之前是否需要先退避。
+        //
+        // 只在「上一次尝试没能把请求送到一个可用的目标」时退避——连接不上目标，
+        // 或者压根还不知道主节点是谁。而**跟着 `ForwardToLeader` 给出的提示去访问
+        // 那个主节点不算重试**：那是执行一次权威的指路，不会形成风暴。
+        //
+        // 这条区分不是微优化，它决定的是一个功能可不可用。从节点的第 0 次尝试
+        // （本地）**必然**得到 `ForwardToLeader`——因为它本来就不是主节点。不做区分
+        // 时，从节点上的每一次读写都要先睡满 RETRY_DELAY 才发出第一次转发，实测
+        // 这一步要 200 毫秒，而「客户端连任意节点都能读写」正是本项目的卖点之一。
+        //
+        // 初值 `false` 只对第 0 次尝试有意义。此后不需要在循环开头重置：**每一条
+        // 会回到循环顶部的路径都会重新给它赋值**（三处 `continue` 与 `Retryable`
+        // 分支），其余路径一律直接返回。
+        let mut backoff = false;
+
         for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
+            if backoff {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
 
@@ -321,13 +341,16 @@ impl Forwarder {
                         Some(addr) => Target::Remote(leader, addr),
                         None => {
                             reason = format!("配置中没有节点 {leader} 的地址");
+                            backoff = true;
                             continue;
                         }
                     },
                     // 还不知道主节点是谁，或者缓存的答案就是自己（可能已过期）。
-                    // 再等一轮，把新一次的本地尝试留给下一轮循环。
+                    // 再等一轮，把新一次的本地尝试留给下一轮循环——这里等的是
+                    // 选举，退避是应该的。
                     _ => {
                         reason = "集群当前没有主节点".to_string();
+                        backoff = true;
                         continue;
                     }
                 }
@@ -360,9 +383,11 @@ impl Forwarder {
                 Target::Remote(leader, addr) => {
                     match exchange(addr, build_request(), FORWARD_TIMEOUT).await {
                         Ok(response) => (leader, response),
-                        // 连接都没建立起来 → 请求肯定没送达 → 重试是安全的
+                        // 连接都没建立起来 → 请求肯定没送达 → 重试是安全的。
+                        // 但也说明这个目标暂时不可用，退避一下再去问别人。
                         Err(TransportFailure::NotSent(source)) => {
                             reason = format!("无法连接节点 {leader}：{source}");
+                            backoff = true;
                             continue;
                         }
                         // 已经发出去了 → 结果不明 → **立即返回，绝不重试**
@@ -383,6 +408,9 @@ impl Forwarder {
                     hint: new_hint,
                 } => {
                     reason = why;
+                    // 对方给了明确的主节点位置 → 直接过去，不用等。
+                    // 只说「我不知道」 → 等的是选举，退避有意义。
+                    backoff = new_hint.is_none();
                     hint = new_hint;
                 }
             }

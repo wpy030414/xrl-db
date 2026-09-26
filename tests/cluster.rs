@@ -18,6 +18,8 @@
 //! 唯一的差别是「杀掉主节点」用的是 [`Node::shutdown`] 而非 `kill -9`。后者由
 //! `scripts/verify-cluster.sh` 以多进程方式验证。
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +27,6 @@ use std::time::Duration;
 
 use openraft::impls::BasicNode;
 
-use xrl_db::config::{Config, Peer, RPC_PORT_OFFSET};
 use xrl_db::kv::WriteOp;
 use xrl_db::node::Node;
 use xrl_db::protocol::{Reply, SetCondition};
@@ -57,12 +58,17 @@ impl TestCluster {
             .collect();
 
         // 为每个节点找一对可用端口（客户端端口、以及 +10000 的节点间通信端口）
-        let addrs = find_port_pairs(CLUSTER_SIZE);
+        let addrs = common::find_port_pairs(CLUSTER_SIZE);
 
         let mut nodes = Vec::new();
         for index in 0..CLUSTER_SIZE {
             let id = index + 1;
-            let config = build_config(id, &addrs, dirs[index as usize].path().to_path_buf());
+            let config = common::cluster_config(
+                id,
+                &addrs,
+                dirs[index as usize].path().to_path_buf(),
+                common::test_raft_config(),
+            );
 
             // 注意用的是 `start` 而非 `start_single`：多节点集群必须显式引导，
             // 否则每个节点都会试图把自己变成单节点集群
@@ -229,80 +235,6 @@ impl TestCluster {
             .await
             .map_err(|error| error.to_string())
     }
-}
-
-/// 为 `count` 个节点各找一对可用端口。
-///
-/// 客户端端口由操作系统分配；节点间通信端口是客户端端口 +10000，必须另行确认可用。
-/// 找不到就重试——这比固定端口号可靠得多，固定端口在并行测试时必然冲突。
-fn find_port_pairs(count: u64) -> Vec<(u64, SocketAddr)> {
-    'outer: loop {
-        let mut chosen = Vec::new();
-
-        for id in 1..=count {
-            let Ok(probe) = std::net::TcpListener::bind("127.0.0.1:0") else {
-                continue 'outer;
-            };
-            let port = probe.local_addr().expect("应能取得地址").port();
-            drop(probe);
-
-            let Some(rpc_port) = port.checked_add(RPC_PORT_OFFSET) else {
-                continue 'outer;
-            };
-            if std::net::TcpListener::bind(("127.0.0.1", rpc_port)).is_err() {
-                continue 'outer;
-            }
-            // 与其他已选端口也不能撞车
-            if chosen
-                .iter()
-                .any(|(_, addr): &(u64, SocketAddr)| addr.port() == port)
-            {
-                continue 'outer;
-            }
-
-            chosen.push((id, SocketAddr::from(([127, 0, 0, 1], port))));
-        }
-
-        return chosen;
-    }
-}
-
-/// 构造一个节点的配置。
-fn build_config(id: u64, addrs: &[(u64, SocketAddr)], data_dir: std::path::PathBuf) -> Config {
-    let config = Config {
-        node: xrl_db::config::NodeConfig {
-            id,
-            listen: addrs
-                .iter()
-                .find(|(peer_id, _)| *peer_id == id)
-                .map(|(_, addr)| *addr)
-                .expect("本节点地址应存在"),
-        },
-        cluster: xrl_db::config::ClusterConfig {
-            enabled: true,
-            peers: addrs
-                .iter()
-                .map(|(peer_id, addr)| Peer {
-                    id: *peer_id,
-                    addr: *addr,
-                })
-                .collect(),
-        },
-        storage: xrl_db::config::StorageConfig {
-            path: Some(data_dir),
-        },
-        raft: xrl_db::config::RaftConfig {
-            // 调快一些让测试不必等太久；生产默认值更保守
-            election_timeout_ms: 300,
-            heartbeat_interval_ms: 100,
-            // 快照与截断策略沿用默认值——这一组测试关心的是集群行为，
-            // 快照由 tests/snapshot.rs 专门盯着
-            ..Default::default()
-        },
-    };
-
-    // `resolve` 会推导默认值并做语义校验，返回可直接使用的配置
-    config.resolve().expect("测试配置应合法")
 }
 
 // ==================================================================== 测试
@@ -531,6 +463,70 @@ async fn forwarding_survives_a_leader_change() {
 // ============================================================ 失去多数派
 //
 // 这一组验证 CP 语义：「分区时拒绝写入」不是一句口号，而是可观测的行为。
+
+/// 连从节点的一次读写允许的中位耗时上限。
+///
+/// 取 100 毫秒：正常值是个位数到几十毫秒（实测读约 1.4ms、写约 30ms），而退避
+/// 缺陷会在这之上再加满 200 毫秒——两边都离这条界很远，既不会误报也不会漏报。
+const FOLLOWER_MEDIAN_BUDGET: Duration = Duration::from_millis(100);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_does_not_pay_a_retry_delay() {
+    // ★ 这条测试锁定的是一个真实修复过的性能缺陷 ★
+    //
+    // 从节点的第 0 次尝试必然在本地得到 `ForwardToLeader`——它本来就不是主节点。
+    // 而退避逻辑曾经不分青红皂白地作用于**每一次**尝试，于是转发的第一步要先睡满
+    // RETRY_DELAY（200ms）：**从节点上的每一次读写都固定多花 200 毫秒**。
+    //
+    // 实测一次读 205ms，240 次读要 49 秒；修好之后 240 次读 0.33 秒。
+    //
+    // 这个缺陷不会让任何断言变红，它只是让「客户端连任意节点都能读写」这个卖点
+    // 在实际使用中难以忍受——而那种退化是没有任何测试会替我们发现的。
+    // 因此这里必须专门盯住**量级**，不能只盯正确性。
+    let cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.follower_of(leader);
+
+    // 先写一个键，让后面读到的是真实存在的数据
+    cluster.set(leader, "warmup", "1").await;
+
+    const SAMPLES: usize = 21;
+
+    let mut read_times = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = std::time::Instant::now();
+        let value = cluster.get(follower, "warmup").await;
+        read_times.push(started.elapsed());
+
+        assert_eq!(
+            value,
+            Reply::Bulk(bytes::Bytes::from_static(b"1")),
+            "连从节点的读拿到了错的数据"
+        );
+    }
+
+    let mut write_times = Vec::with_capacity(SAMPLES);
+    for index in 0..SAMPLES {
+        let started = std::time::Instant::now();
+        cluster.set(follower, &format!("probe-{index}"), "x").await;
+        write_times.push(started.elapsed());
+    }
+
+    // 用中位数而不是最大值：单次抖动（线程调度、磁盘 fsync）不该让这条断言变红，
+    // 而退避缺陷会让**每一次**都慢，中位数必然被顶上去。
+    for (label, mut times) in [("读", read_times), ("写", write_times)] {
+        times.sort();
+        let median = times[times.len() / 2];
+        let worst = times[times.len() - 1];
+
+        assert!(
+            median < FOLLOWER_MEDIAN_BUDGET,
+            "连从节点的{label}操作中位耗时 {median:?}（最慢 {worst:?}），\
+             超过了 {FOLLOWER_MEDIAN_BUDGET:?}。从节点转发本身是确定要做的动作，\
+             为它先退避一次 RETRY_DELAY 会让每一次读写都固定多花 200 毫秒。"
+        );
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_minority_refuses_writes_and_never_hangs() {
