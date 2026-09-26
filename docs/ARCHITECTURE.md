@@ -55,8 +55,9 @@
 | `config.rs` | 读取并校验配置；把 TOML 与 `redis.conf` 两种格式归一到同一个强类型 `Config` |
 | `error.rs` | 全局统一错误类型，供各层共享 |
 | `node.rs` | 节点协调者：按依赖顺序拼装存储、Raft、网络，处理启动与优雅关闭 |
-| `protocol/resp.rs` | RESP3 编解码。基于 `redis-protocol` 的 `codec` 模块（其自身为零拷贝）配合 tokio-util 的 `Framed` 组织 I/O |
-| `protocol/command.rs` | 把 RESP3 的值解析为强类型 `Command` 枚举，并做参数校验 |
+| `protocol/codec.rs` | 统一编解码器，协议层对外唯一入口。把 RESP2/RESP3 的方言差异封在内部；区分「命令层面错误」（连接继续）与「帧层面错误」（必须断连） |
+| `protocol/command.rs` | 把帧解析为强类型 `Command` 枚举，并做参数校验。错误文本遵循 Redis 标准措辞 |
+| `protocol/reply.rs` | 构造与方言无关的 `Reply`，并按当前方言编码为对应帧 |
 | `server/listener.rs` | TCP 监听与连接生命周期管理 |
 | `server/session.rs` | 单连接会话：读命令 → 分发 → 写回结果 |
 | `raft/log_store.rs` | `RaftLogStorage` 实现：日志的持久化、读取、截断、投票状态 |
