@@ -101,7 +101,7 @@
 **能力**
 
 - 单 Raft 组强一致（3 节点容忍 1 台故障）
-- follower 上的写请求透明转发
+- follower 上的写请求透明转发；follower 上的读走 ReadIndex，**本地读且保证不陈旧**
 - TOML 与 `redis.conf` 双格式配置
 - 快照与 Raft 日志截断
 - 本地三节点启停与故障验证脚本
@@ -112,13 +112,20 @@
 - **Hash / List / Set / ZSet**：数据模型扩展，不影响核心正确性，可后置
 - **AUTH 与访问控制**：默认只监听 `127.0.0.1`，对外暴露须显式改配置
 - **`CONFIG GET/SET/REWRITE`**：Redis 运行时改配置的完整语义（尤其 `REWRITE` 的温和重写）
-- **从 follower 读的降级模式**：牺牲一致性换吞吐，与项目定位冲突，需谨慎设计
+- **从 follower 读的降级模式**：指牺牲一致性换吞吐——允许从节点直接返回本地数据、接受它可能陈旧。这与项目定位冲突。**注意区分**：从节点上的**线性一致读**是已经实现的（见 `docs/specs/module-raft.md` 的 ReadIndex），它读本地数据但保证不陈旧，不是这里说的降级模式
 - **自动化成员变更**：仅提供 `RAFT ADD-NODE` 手工入口
+- **请求去重**：客户端带请求号 + 服务端去重表，把转发路径上的「至少一次」变成「恰好一次」。见 `docs/DECISIONS.md` 的 ADR-013
 
 ## 成功指标
 
-- [ ] 官方 `redis-cli` 无改造可连接并完成读写
-- [ ] 三节点集群，写入 100 个键后 `kill -9` leader，新 leader 上任后 100 个键全部可读
-- [ ] 少数派分区时拒绝写入，不产生脑裂
-- [ ] `cargo test` 全绿，`cargo clippy` 无警告
-- [ ] 存储实现通过 `openraft::testing::Suite::test_all`
+- [x] 官方 `redis-cli` 无改造可连接并完成读写
+- [x] 三节点集群，写入 100 个键后 `kill -9` leader，新 leader 上任后 100 个键全部可读
+- [x] 少数派分区时拒绝写入，不产生脑裂
+- [x] 少数派分区时，读写都在限时内被拒绝——**不挂起**
+- [x] 连 follower 执行写命令，服务端透明转发，客户端无感知
+- [x] 连 follower 执行 20 次 `INCR`，结果精确等于 20（转发路径不重复执行）
+- [x] 整组重启（同一份数据目录）后数据仍可读
+- [x] 日志不随写入无限增长（写入量翻倍，留存跨度不翻倍）
+- [x] 三节点真实进程 + 真实 `kill -9`：`./scripts/verify-cluster.sh` 退出码为 0
+- [x] `cargo test` 全绿，`cargo clippy` 无警告
+- [x] 存储实现通过 `openraft::testing::Suite::test_all`

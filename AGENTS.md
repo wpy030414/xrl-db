@@ -40,6 +40,8 @@
 3. **错误类型统一**：使用 `src/error.rs` 中定义的自定义错误类型，通过 `thiserror` 风格的手写实现或统一枚举传递，禁止到处 `Box<dyn Error>`。
 4. **先做出单机可用版本，再接入 Raft**。这是刻意的顺序——分布式调试最怕整条链路同时不可用，先让协议层单独跑通。
 5. **openraft 一律以 0.9 的 API 为准**。0.9 已把旧的单一 `RaftStorage` 拆成 `RaftLogStorage` + `RaftStateMachine` 两个 trait，网上大量教程（含官方 getting-started 页）仍是 0.8 旧 API，**照抄会编译不过**。
+6. **「结果未知」不得被改写成「失败」或「成功」**。一次写入在请求发出之后失败时，无法判断它是否已经生效。任何把它当作确定结果来处理的改动——尤其是「失败就重试」——都可能让一条 `INCR` 被执行两次。修改 `src/raft/forward.rs` 之前先读它的模块文档。
+7. **失去多数派时必须拒绝服务，且必须在限时内拒绝**。降级为读本地、或让请求无限挂起，都是比不可用更糟的结果：前者返回过期数据，后者让调用方无从判断该不该重试。
 
 ### 代码风格
 
@@ -61,15 +63,16 @@
 
 | 路径 | 职责 |
 |---|---|
-| `src/main.rs` | 入口：CLI 解析、配置加载、启动 |
+| `src/main.rs` | 入口：CLI 解析、配置加载、启动；必要时按配置组建集群 |
 | `src/config.rs` | 配置加载与校验（TOML 与 `redis.conf` 归一） |
 | `src/error.rs` | 统一错误类型 |
+| `src/backend.rs` | 命令执行后端：分派写/读路径，实现管理命令 |
 | `src/node.rs` | 节点协调：拼装 Raft + 网络 + 存储 |
-| `src/protocol/` | RESP3 编解码与命令解析 |
+| `src/protocol/` | RESP2/RESP3 编解码与命令解析 |
 | `src/server/` | TCP 监听、连接管理、命令分发 |
-| `src/raft/` | openraft 存储 trait 实现与节点间 RPC |
-| `src/kv/` | 键值数据模型与 TTL 逻辑 |
+| `src/raft/` | openraft 存储 trait 实现、节点间 RPC、客户端转发 |
+| `src/kv/` | 键值数据模型、TTL、可复制的写操作 `WriteOp` |
 | `docs/` | 项目文档（见 README 的文档索引） |
 | `docs/specs/` | 各模块详细规格，随模块实现逐步填充 |
-| `scripts/` | 集群启停与验证脚本 |
-| `tests/` | 集成测试 |
+| `scripts/` | 集群启停与端到端验收脚本（`verify-cluster.sh` 用真实 `kill -9`） |
+| `tests/` | 集成测试：`cluster.rs` 集群、`snapshot.rs` 截断、`raft_storage.rs` 协议套件、`server.rs` 原始 RESP 字节 |

@@ -51,19 +51,24 @@
 
 | 模块 | 职责 |
 |---|---|
-| `main.rs` | 进程入口：解析 CLI、加载配置、启动 `Node` |
+| `main.rs` | 进程入口：解析 CLI、加载配置、启动 `Node`，必要时按配置组建集群 |
 | `config.rs` | 读取并校验配置；把 TOML 与 `redis.conf` 两种格式归一到同一个强类型 `Config` |
 | `error.rs` | 全局统一错误类型，供各层共享 |
+| `backend.rs` | 命令执行后端：把 `Command` 分派到写路径或读路径，并实现 `INFO` / `CLUSTER` / `RAFT *` 等管理命令 |
 | `node.rs` | 节点协调者：按依赖顺序拼装存储、Raft、网络，处理启动与优雅关闭 |
 | `protocol/codec.rs` | 统一编解码器，协议层对外唯一入口。把 RESP2/RESP3 的方言差异封在内部；区分「命令层面错误」（连接继续）与「帧层面错误」（必须断连） |
 | `protocol/command.rs` | 把帧解析为强类型 `Command` 枚举，并做参数校验。错误文本遵循 Redis 标准措辞 |
 | `protocol/reply.rs` | 构造与方言无关的 `Reply`，并按当前方言编码为对应帧 |
 | `server/listener.rs` | TCP 监听与连接生命周期管理 |
 | `server/session.rs` | 单连接会话：读命令 → 分发 → 写回结果 |
-| `raft/log_store.rs` | `RaftLogStorage` 实现：日志的持久化、读取、截断、投票状态 |
-| `raft/state_machine.rs` | `RaftStateMachine` 实现：把已提交的日志条目应用到 KV 状态机 |
-| `raft/network.rs` | 节点间 Raft RPC 的收发 |
+| `raft/types.rs` | `TypeConfig`：把「日志条目是 `WriteOp`、状态机返回 `Reply`」这件事固化下来 |
+| `raft/log_store.rs` | `RaftLogStorage` / `RaftLogReader` 实现：日志的持久化、读取、截断、投票状态 |
+| `raft/state_machine.rs` | `RaftStateMachine` / `RaftSnapshotBuilder` 实现：把已提交的日志条目应用到 KV 状态机，并生成快照 |
+| `raft/rpc.rs` | 节点间 RPC 的线路协议与服务端；同时也是「转发给主节点」的落点 |
+| `raft/network.rs` | 节点间 Raft RPC 的客户端侧（`RaftNetwork` / `RaftNetworkFactory`） |
+| `raft/forward.rs` | 把客户端请求转交给主节点：写请求原样转发，读索引请求只取一个日志位置 |
 | `kv/store.rs` | 键值数据模型：String 值、TTL 过期判定 |
+| `kv/op.rs` | `WriteOp`：写入的**确定性表示**。所有相对时间在此被解析为绝对时刻 |
 
 ## 模块关系
 
@@ -72,14 +77,18 @@
 ```
 main ──► config / node ──► server ──► protocol
                     │          │
-                    │          └──► raft ──► kv
+                    │          └──► backend ──► kv
                     │                 │
-                    └─────────────────┴──► storage（redb）
+                    └─────────────────┴──► raft ──► kv
+                                            │
+                                            └──► storage（redb）
 ```
 
 - `protocol` 完全不知道 Raft 的存在。它只负责「字节 → Command」和「Reply → 字节」。
 - `kv` 完全不知道网络的存在。它只实现「应用一条写命令」这个纯函数式的语义。
-- `raft` 是唯一同时理解「共识」与「存储」的层。
+- `raft` 是唯一同时理解「共识」与「存储」的层。它引用 `kv::WriteOp` 与 `protocol::Reply`
+  是**合法的**——这两个类型正是 Raft 类型配置（`TypeConfig`）里的载荷类型，翻遍
+  `raft/` 也不会找到「客户端命令」或「RESP 帧」这类概念。
 - `node` 是唯一知道所有组件如何拼装的层。
 
 **这条分层的意义**：`protocol` 与 `kv` 都能独立单测。这也是实施顺序上「先做出单机可用版本」的架构基础——单机版的链路是 `session → protocol → kv`，完全不经过 `raft`。
@@ -95,7 +104,10 @@ main ──► config / node ──► server ──► protocol
 listener → session
   │
   ▼
-protocol/resp 解析 ──► protocol/command 得到 Command::Set
+protocol/codec 解析 ──► protocol/command 得到 Command::Set
+  │
+  ▼
+backend 把 Command 转为 WriteOp（相对时间在此解析为绝对时刻）
   │
   ▼
 raft: 提交到 Raft 日志
@@ -118,19 +130,73 @@ state_machine 应用该条目 ──► kv/store 写入 → redb
 ```
 客户端 ──► follower 的 session
                 │
-                │ 检测到本节点非 leader
                 ▼
-        转发到 leader ──► 走上面的完整流程
+        forward：先在本地试一次
                 │
-                ▼
-        把 leader 的结果原样回写给客户端
+                ├─ 本节点就是主节点 ──► 走上面的完整流程，零额外开销
+                │
+                └─ 不是主节点 ──► 本地会直接告知主节点是谁
+                                    │
+                                    ▼
+                          通过节点间 RPC 转发给主节点 ──► 走上面的完整流程
+                                    │
+                                    ▼
+                          把主节点的结果原样回写给客户端
 ```
 
 对客户端完全透明——它不需要知道集群拓扑。
 
+**为什么第一次尝试一定在本地做**：本地 Raft 实例对「谁是主节点」的判断比任何缓存都权威。
+它要么直接完成提交（省掉一次多余的往返），要么给出一个准确的 `ForwardToLeader` 提示。
+
 ### 读命令
 
-默认**也走 leader**，以保证线性一致。若允许从 follower 读，会读到可能过期的数据，这与项目定位冲突，因此首版不开放。
+读**不转发**。从节点只向主节点要一个「线性一致读索引」，然后等自己的状态机追平该索引，
+再**本地**读取：
+
+```
+客户端 ──► 任意节点的 session
+              │
+              ▼
+      forward.read_index()
+              │
+              ├─ 本节点是主节点 ──► ensure_linearizable()：向多数派确认领导权
+              │
+              └─ 不是主节点 ──► 向主节点要它刚确认过的日志位置
+                                    │
+                                    ▼
+                        等待本地状态机追平到该位置
+                                    │
+                                    ▼
+                        读取本地状态（数据不必搬来搬去）
+```
+
+这就是 Raft 论文里的 ReadIndex。它保证读**绝不会返回过期数据**，同时不让所有读都汇聚到
+主节点——读取吞吐可以随节点数扩展。
+
+失去多数派时，读会被**拒绝**而不是降级为读本地：无法确认时效性的读等于返回可能过期的值，
+那正是本项目要消灭的东西。
+
+### 快照与日志截断
+
+```
+写入 N 条日志
+  │
+  ▼
+累计超过 snapshot_logs_since_last ──► 生成快照（状态机全量落盘）
+  │
+  ▼
+快照点之前的日志被截断，只保留 max_in_snapshot_log_to_keep 条
+  │
+  ▼
+日志占用的磁盘趋于稳定，不再随写入量增长
+```
+
+日志**只能靠快照截断**：只有进了快照的那部分才允许删除，否则一个落后的从节点无法靠日志
+追上来。因此「多久建一次快照」实际上就是「日志能占多大磁盘」。
+
+保留一段日志（而不是立刻删干净）是为了让「只落后一点点」的从节点仍然走普通的日志复制，
+而不是被迫接收可能是几百兆的整个快照。
 
 ### 启动与崩溃恢复
 
@@ -149,6 +215,9 @@ state_machine 应用该条目 ──► kv/store 写入 → redb
   ▼
 恢复投票状态（term / voted_for）
   │
+  ├─ 首次启动（带 --bootstrap）──► 初始化成员集合
+  └─ 重启既有节点 ──► 沿用磁盘上的成员配置
+  │
   ▼
 启动网络服务 → 参与选举或恢复 leader 身份
 ```
@@ -160,7 +229,7 @@ state_machine 应用该条目 ──► kv/store 写入 → redb
 | Redis 客户端 | 通过 RESP3 协议连接。本项目的兼容性以官方 `redis-cli` 为准 |
 | `redis-protocol` | 提供 RESP3 编解码实现。本项目使用其 `codec` 模块，不自研协议层（见 ADR-011） |
 | openraft | 提供 Raft 共识实现。本项目实现其存储 trait 并接入网络层 |
-| redb | 提供本地事务性存储。本项目在其上建两张表：Raft 日志、KV 状态机 |
+| redb | 提供本地事务性存储。本项目在其上建三张表：Raft 日志与元数据、KV 状态机、快照 |
 
 ## 重要技术边界
 
@@ -168,8 +237,16 @@ state_machine 应用该条目 ──► kv/store 写入 → redb
 
 2. **单 Raft 组的写入吞吐上限 = 单个 leader 的吞吐上限**。所有写都要经过同一个 leader 并等待多数派确认。这是当前架构的固有特性，分片（下一阶段）才能突破。
 
-3. **openraft 0.9 的 API 与 0.8 不兼容**。0.9 把旧的单一 `RaftStorage` 拆分为 `RaftLogStorage` + `RaftStateMachine`。网上大量教程（含官方 getting-started 页）仍是 0.8 写法，照抄无法编译。
+3. **「结果未知」是一种必须原样传递的一等状态**。一次写入在请求发出之后失败（超时、连接中断、对端停止）时，**无法判断它是否已经生效**。此时绝不允许自动重试——那可能让一条 `INCR` 被执行两次。调用方必须把这个不确定性原样交给客户端。这条约束贯穿 `raft/forward.rs` 的全部错误处理，修改那里之前请先读它的模块文档。
 
-4. **共识延迟是硬代价**。每次写入需要一次额外的网络往返（同机房约 0.5–2ms）来等待多数派确认。这是换来「不丢数据」的价格，无法优化掉，只能通过部署拓扑（同机房、低延迟网络）缓解。
+4. **只有主节点能确认领导权**。线性一致读的第一步（`ensure_linearizable`）在从节点上必然失败，因此从节点必须先从主节点取得读索引。不存在「就地确认」的捷径。
 
-5. **`raft` 层是唯一同时持有「共识状态」与「存储句柄」的地方**。其他层不应直接访问 redb，否则会绕过 Raft 的顺序保证，造成状态机与日志不一致。
+5. **openraft 0.9 的 API 与 0.8 不兼容**。0.9 把旧的单一 `RaftStorage` 拆分为 `RaftLogStorage` + `RaftStateMachine`。网上大量教程（含官方 getting-started 页）仍是 0.8 写法，照抄无法编译。
+
+6. **共识延迟是硬代价**。每次写入需要一次额外的网络往返（同机房约 0.5–2ms）来等待多数派确认。这是换来「不丢数据」的价格，无法优化掉，只能通过部署拓扑（同机房、低延迟网络）缓解。
+
+7. **运行时新增的节点不在静态配置里**。节点地址优先取自 `cluster.peers`，取不到时退回 Raft
+   成员信息中登记的地址。两处（`raft/network.rs` 与 `raft/forward.rs`）必须采用同一策略，
+   否则会出现「日志能复制、客户端请求却转不过去」这种极难解释的现象。
+
+8. **`raft` 层是唯一同时持有「共识状态」与「存储句柄」的地方**。其他层不应直接访问 redb，否则会绕过 Raft 的顺序保证，造成状态机与日志不一致。
