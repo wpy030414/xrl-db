@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, InitializeError, RaftError};
+use openraft::error::{ClientWriteError, Fatal, InitializeError, RaftError};
 use openraft::impls::BasicNode;
 use openraft::{ChangeMembers, Config as RaftConfig, Raft, RaftMetrics, StorageError};
 use redb::Database;
@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::kv::{Store, WriteOp};
 use crate::protocol::Reply;
+use crate::raft::forward::{ForwardError, Forwarder};
 use crate::raft::log_store::LogStore;
 use crate::raft::network::NetworkFactory;
 use crate::raft::state_machine::StateMachine;
@@ -72,20 +73,26 @@ pub enum NodeError {
     /// Raft 实例启动失败。
     Startup(Fatal<NodeId>),
 
-    /// 写请求被拒绝（不是 leader、超时等）。
-    Write(RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>),
-
-    /// 读请求未能确认领导权。
-    ///
-    /// 线性一致读要求先确认本节点仍是 leader 且状态机已追平；这个错误表示该前提
-    /// 未能满足。客户端应当改连 leader 后重试。
-    Read(RaftError<NodeId, CheckIsLeaderError<NodeId, BasicNode>>),
-
     /// 集群初始化失败。
     Initialize(RaftError<NodeId, InitializeError<NodeId, BasicNode>>),
 
     /// 成员变更失败。
     Membership(RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>),
+
+    /// 请求转交主节点失败。
+    ///
+    /// 注意其中的 [`ForwardError::OutcomeUnknown`]：那表示一次写入**可能已经生效**，
+    /// 调用方必须原样上报，绝不可当作「失败」来自动重试。
+    Forward(ForwardError),
+
+    /// 等待本地状态机追平主节点确认的读索引时超时。
+    ///
+    /// 出现它说明本节点落后于主节点太多（网络慢、或正在追赶快照）。**不能退化成
+    /// 直接读本地**——那等于返回过期数据，正是本项目要消灭的东西。
+    ReadLagging {
+        /// 主节点确认的索引。
+        index: u64,
+    },
 }
 
 impl fmt::Display for NodeError {
@@ -103,10 +110,14 @@ impl fmt::Display for NodeError {
             }
             NodeError::InvalidConfig(source) => write!(f, "{source}"),
             NodeError::Startup(source) => write!(f, "Raft 实例启动失败：{source}"),
-            NodeError::Write(source) => write!(f, "写请求未能提交：{source}"),
-            NodeError::Read(source) => write!(f, "读请求未能确认领导权：{source}"),
             NodeError::Initialize(source) => write!(f, "集群初始化失败：{source}"),
             NodeError::Membership(source) => write!(f, "成员变更失败：{source}"),
+            NodeError::Forward(source) => write!(f, "{source}"),
+            NodeError::ReadLagging { index } => write!(
+                f,
+                "本节点尚未追平到主节点确认的日志位置 {index}，\
+                 为避免返回过期数据，本次读取已被拒绝；稍后重试即可"
+            ),
         }
     }
 }
@@ -120,10 +131,10 @@ impl std::error::Error for NodeError {
             NodeError::BindRpc { source, .. } => Some(source),
             NodeError::InvalidConfig(source) => Some(source),
             NodeError::Startup(source) => Some(source),
-            NodeError::Write(source) => Some(source),
-            NodeError::Read(source) => Some(source),
             NodeError::Initialize(source) => Some(source),
             NodeError::Membership(source) => Some(source),
+            NodeError::Forward(source) => Some(source),
+            NodeError::ReadLagging { .. } => None,
         }
     }
 }
@@ -138,6 +149,11 @@ pub struct Node {
     /// 状态机被交给了 Raft 独占，但它自身是可克隆的——节点保留一份，
     /// 便能在确认领导权之后直接读本地状态，而不必经过共识。
     state_machine: StateMachine,
+    /// 把客户端请求转交给主节点。
+    ///
+    /// 有了它，客户端连到任何一个节点都能读写——这正是相对 Redis Cluster 的
+    /// 额外卖点：Redis 需要客户端自己实现槽位路由，我们不需要。
+    forwarder: Forwarder,
 }
 
 impl Node {
@@ -201,11 +217,14 @@ impl Node {
             }
         });
 
+        let forwarder = Forwarder::new(config.node.id, raft.clone(), &config);
+
         Ok(Self {
             id: config.node.id,
             raft,
             rpc_addr,
             state_machine: read_handle,
+            forwarder,
         })
     }
 
@@ -259,26 +278,62 @@ impl Node {
     ///
     /// 这个方法返回时，写入**已经存在于多数派节点上**——这正是「不丢数据」
     /// 承诺的兑现点。
+    ///
+    /// 本节点不是主节点时，操作会被转交给主节点执行（见 [`Forwarder`]），
+    /// 调用方无需知道自己是连在哪个节点上。因此本方法只有一条代码路径，
+    /// 「连主节点」与「连从节点」不会分叉成两种行为。
+    ///
+    /// # 错误
+    ///
+    /// 特别注意 [`ForwardError::OutcomeUnknown`]：它表示写入**可能已经生效**。
+    /// 调用方必须把它如实上报给客户端，不能当作失败而自动重试——那会让一条
+    /// `INCR` 被执行两次。
     pub async fn write(&self, op: WriteOp) -> Result<Reply, NodeError> {
-        let response = self.raft.client_write(op).await.map_err(NodeError::Write)?;
-        Ok(response.data)
+        self.forwarder.write(op).await.map_err(NodeError::Forward)
     }
 
     /// 执行一次线性一致读。
     ///
-    /// 先通过 [`Raft::ensure_linearizable`] 向多数派确认本节点仍是 leader、且状态机
-    /// 已追平到该时刻，**然后**才读本地状态机。少了这一步，从库或已退位的旧 leader
-    /// 就会返回过期数据——那正是本项目承诺要避免的事情。
+    /// # 读为什么不必把请求转给主节点
     ///
-    /// 这一步的代价是一次心跳往返，比读操作本身贵，但换来的是「读到的绝不是旧值」。
+    /// 线性一致读分两步。第一步是**确认一个足够新的日志位置**：
+    ///
+    /// - 本节点是主节点时，直接向多数派发一轮心跳确认自己的领导权
+    ///   （openraft 的 `ensure_linearizable`）；
+    /// - 本节点是**从**节点时，向主节点要一个它刚刚确认过的日志位置
+    ///   （Raft 论文里的 ReadIndex）。
+    ///
+    /// 第二步是**等待本地状态机追平该位置**，然后读本地。
+    ///
+    /// 关键在于第二步读的是本地数据——数据不必从主节点搬过来，读取吞吐也不会
+    /// 因为全部汇聚到主节点而受限。少了第一步，从节点或已退位的旧主节点就会返回
+    /// 过期数据；少了第二步也同样会——状态机可能还没追上那个位置。
+    ///
+    /// # 错误
+    ///
+    /// 追平超时会返回 [`NodeError::ReadLagging`]。此时**绝不放行这次读取**：
+    /// 宁可让客户端重试，也不返回一个可能已经过期的值。
     pub async fn read<F, T>(&self, read: F) -> Result<T, NodeError>
     where
         F: FnOnce(&Store) -> T,
     {
-        self.raft
-            .ensure_linearizable()
+        let read_index = self
+            .forwarder
+            .read_index()
             .await
-            .map_err(NodeError::Read)?;
+            .map_err(NodeError::Forward)?;
+
+        // 日志为空时读索引为 None——此时没有任何已提交的数据，无需等待
+        if let Some(log_id) = read_index
+            && !self
+                .wait_for_applied(log_id.index, READ_INDEX_TIMEOUT)
+                .await
+        {
+            return Err(NodeError::ReadLagging {
+                index: log_id.index,
+            });
+        }
+
         Ok(self.state_machine.read(read))
     }
 
@@ -383,6 +438,12 @@ impl Node {
 /// 给得比选举超时宽松得多：单节点不需要和任何人通信，正常情况下是瞬时的；
 /// 留出余量只是为了容忍调度延迟。
 const SINGLE_NODE_ELECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 等待本地状态机追平读索引的上限。
+///
+/// 正常情况下落后的从节点只需要毫秒级就能追上——条目已经是提交状态，复制流不会断。
+/// 给到秒级是为了容忍「节点正在安装快照」这种确实需要一段时间的情况。
+const READ_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 把 Raft 的服务器状态映射为纯文本。
 ///

@@ -274,6 +274,19 @@ impl Config {
             .find(|peer| peer.id == id)
             .and_then(|peer| rpc_addr_of(peer.addr).ok())
     }
+
+    /// 全部节点的 RPC 地址表，按节点 ID 索引。
+    ///
+    /// 地址推导失败的节点会被跳过——[`Config::validate`] 早已拦下这种情况，
+    /// 这里只是不让一个坏地址拖垮整张表。节点间通信与客户端转发都需要这张表，
+    /// 共用一处实现可以保证两者的寻址行为完全一致。
+    pub fn peer_rpc_addrs(&self) -> std::collections::HashMap<NodeId, SocketAddr> {
+        self.cluster
+            .peers
+            .iter()
+            .filter_map(|peer| self.peer_rpc_addr(peer.id).map(|addr| (peer.id, addr)))
+            .collect()
+    }
 }
 
 /// 由客户端地址推导节点间 RPC 地址。

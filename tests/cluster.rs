@@ -108,6 +108,18 @@ impl TestCluster {
             .unwrap_or_else(|| panic!("节点 {id} 已不存活"))
     }
 
+    /// 关掉一个节点，并把它从存活集合里摘掉。
+    ///
+    /// **必须摘掉**：只调用 `shutdown` 而保留那个 `Arc`，后续按「存活」筛选节点时
+    /// 就会选中一个 Raft 已经停止的实例。症状是测试随机失败，且失败信息里出现
+    /// 「本节点在处理请求时停止服务」——看起来像转发逻辑有 bug，其实是测试自己
+    /// 把请求发给了一个已经死掉的节点。这个坑值得用一次崩溃来记住。
+    async fn kill(&mut self, id: u64) {
+        if let Some(node) = self.nodes[(id - 1) as usize].take() {
+            node.shutdown().await;
+        }
+    }
+
     /// 取某个节点的客户端地址。
     fn addr_of(&self, id: u64) -> SocketAddr {
         self.addrs
@@ -157,7 +169,31 @@ impl TestCluster {
                 condition: SetCondition::Always,
             })
             .await
-            .expect("写入应当成功")
+            .unwrap_or_else(|error| panic!("往节点 {id} 写入 {key} 失败：{error}"))
+    }
+
+    /// 对键做一次自增。
+    ///
+    /// 刻意挑一条**非幂等**的命令来验证转发：它最能暴露「把结果未知当成失败来重试」
+    /// 这类缺陷——重试一次，计数器就会多加一。
+    async fn incr(&self, id: u64, key: &str) -> Reply {
+        self.node(id)
+            .write(WriteOp::IncrBy {
+                key: bytes::Bytes::copy_from_slice(key.as_bytes()),
+                delta: 1,
+            })
+            .await
+            .expect("自增应当成功")
+    }
+
+    /// 取一个**存活且不是主节点**的节点。
+    ///
+    /// 必须同时检查存活：在故障转移测试里，编号最小的非主节点很可能正是刚被关掉的
+    /// 那一个，直接挑它会得到一个永远连不上的地址。
+    fn follower_of(&self, leader: u64) -> u64 {
+        (1..=CLUSTER_SIZE)
+            .find(|id| *id != leader && self.nodes[(*id - 1) as usize].is_some())
+            .expect("集群中必然存在存活的从节点")
     }
 
     /// 读一个键。
@@ -273,7 +309,7 @@ async fn data_survives_leader_failure() {
     //
     // Redis Cluster 在这个场景下会丢失尚未同步到副本的写入。我们不丢——
     // 因为每一次写入都是等到多数派确认之后才回给客户端的。
-    let cluster = TestCluster::start().await;
+    let mut cluster = TestCluster::start().await;
     let leader = cluster.wait_for_leader().await;
 
     const KEY_COUNT: usize = 100;
@@ -284,8 +320,7 @@ async fn data_survives_leader_failure() {
     }
 
     // 杀掉主节点
-    let fallen = cluster.node(leader).clone();
-    fallen.shutdown().await;
+    cluster.kill(leader).await;
 
     // 等新主节点产生（剩下的两个节点仍构成多数派）
     let survivors = CLUSTER_SIZE - 1;
@@ -319,11 +354,11 @@ async fn data_survives_leader_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_keeps_serving_after_leader_returns() {
     // 被关闭的节点重启后应能重新加入，且不影响现有集群继续服务
-    let cluster = TestCluster::start().await;
+    let mut cluster = TestCluster::start().await;
     let leader = cluster.wait_for_leader().await;
 
     cluster.set(leader, "before", "1").await;
-    cluster.node(leader).shutdown().await;
+    cluster.kill(leader).await;
 
     let new_leader = wait_for_leader_among(&cluster, 1..=CLUSTER_SIZE, Some(leader))
         .await
@@ -341,6 +376,127 @@ async fn cluster_keeps_serving_after_leader_returns() {
         cluster.get(new_leader, "during").await,
         Reply::Bulk(bytes::Bytes::from_static(b"2")),
         "故障转移后写入的数据必须可读"
+    );
+}
+
+// ============================================================ 客户端转发
+//
+// 下面这组测试验证的是立项时列出的另一条验收标准：
+//
+// > **客户端连任意一个节点都能读写。**
+//
+// Redis Cluster 做不到这一点：连到从节点的写入会被 `MOVED` 重定向弹回去，客户端
+// 必须自己维护槽位映射、自己找主节点。我们替客户端把这件事做完。
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_forwards_writes_to_the_leader() {
+    let cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.follower_of(leader);
+
+    // 写入发到从节点——服务端应当转交给主节点，而不是回一个「我不是主节点」
+    assert_eq!(
+        cluster.set(follower, "via-follower", "hello").await,
+        Reply::ok(),
+        "发往从节点的写入应当被转发，而不是失败"
+    );
+
+    // 数据必须真的进了集群：主节点与从节点都读得到
+    let expected = Reply::Bulk(bytes::Bytes::from_static(b"hello"));
+    assert_eq!(
+        cluster.get(leader, "via-follower").await,
+        expected,
+        "转发过去的写入必须真的被提交"
+    );
+    assert_eq!(cluster.get(follower, "via-follower").await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarding_does_not_duplicate_non_idempotent_writes() {
+    // ★ 这条是转发路径上最要命的缺陷模式 ★
+    //
+    // 自增不是幂等的：一旦「主节点其实已经执行了，只是响应丢了」被当成失败重试，
+    // 计数器就会多加。这里连着做 20 次自增并核对最终值——多执行一次都会被抓出来。
+    let cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.follower_of(leader);
+
+    const ROUNDS: i64 = 20;
+    for round in 1..=ROUNDS {
+        assert_eq!(
+            cluster.incr(follower, "counter").await,
+            Reply::Integer(round),
+            "第 {round} 次自增的返回值不符——多一次或少一次都说明转发路径重复执行了命令"
+        );
+    }
+
+    assert_eq!(
+        cluster.get(leader, "counter").await,
+        Reply::Bulk(bytes::Bytes::from(ROUNDS.to_string())),
+        "转发 20 次自增之后，计数器的值必须精确等于 20"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_reads_the_latest_committed_write() {
+    // 从节点的读不能返回旧数据。这里「写完立刻从从节点读」，中间不给任何等待——
+    // 如果读路径没有先确认读索引、没有等状态机追平，就会读到空值。
+    let cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.follower_of(leader);
+
+    for round in 0..20 {
+        let key = format!("latest-{round}");
+        let value = format!("value-{round}");
+
+        cluster.set(leader, &key, &value).await;
+        assert_eq!(
+            cluster.get(follower, &key).await,
+            Reply::Bulk(bytes::Bytes::from(value.clone())),
+            "从节点读不到刚刚提交的写入（第 {round} 轮）——读路径没有做到线性一致"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarding_survives_a_leader_change() {
+    // 客户端一直连在同一个**从节点**上，期间主节点挂了、集群换了主节点。
+    // 客户端不该有任何感知：它既不需要重连，也不需要知道主节点换成了谁。
+    let mut cluster = TestCluster::start().await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.follower_of(leader);
+
+    cluster.set(follower, "before", "1").await;
+
+    // 杀掉主节点
+    cluster.kill(leader).await;
+
+    // 剩下的两个节点里必然有一个成为新主节点，从节点也会更新自己的视图
+    let new_leader = wait_for_leader_among(&cluster, 1..=CLUSTER_SIZE, Some(leader))
+        .await
+        .expect("剩余节点应能选出新主节点");
+
+    // 仍然往原来那个从节点写——它现在应当转发给新主节点
+    let target = if follower == new_leader {
+        // 原来那个从节点自己当上了主节点，那就换一个从节点来验证转发
+        cluster.follower_of(new_leader)
+    } else {
+        follower
+    };
+
+    assert_eq!(
+        cluster.set(target, "after", "2").await,
+        Reply::ok(),
+        "主节点变更后，从节点应能转发到新主节点"
+    );
+    assert_eq!(
+        cluster.get(new_leader, "after").await,
+        Reply::Bulk(bytes::Bytes::from_static(b"2"))
+    );
+    // 换届之前的数据一个都不能丢
+    assert_eq!(
+        cluster.get(new_leader, "before").await,
+        Reply::Bulk(bytes::Bytes::from_static(b"1"))
     );
 }
 

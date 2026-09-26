@@ -17,19 +17,33 @@
 //! 的情况：前者应当让 leader 立即退位，后者只值得重试。如果把远端错误压成一个字符串，
 //! 客户端就无法区分二者。因此 [`RpcResponse`] 里直接带上 `RaftError`——它在
 //! openraft 的 `serde` feature 下可序列化。
+//!
+//! # 为什么「客户端转发」也走这条通道
+//!
+//! 客户端连到非主节点时，该节点需要把请求转给主节点（见 [`crate::raft::forward`]）。
+//! 这件事完全可以另开一个端口、另写一套协议，但那会带来两个新的问题：多一个需要
+//! 配置与放行的端口，以及一套与现有通道并行的连接管理逻辑。
+//!
+//! 更重要的是：节点间的这条通道**已经是**「把请求交给对端 Raft 实例」的抽象，
+//! 而写入与读索引恰好就是这种请求。因此 [`RpcRequest`] 里多了两个变体，
+//! 载荷类型（[`WriteOp`]、[`Reply`]）也本就是本层类型配置里已有的类型——
+//! 没有引入任何新的跨层依赖。
 
-use openraft::Raft;
-use openraft::error::{InstallSnapshotError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, InstallSnapshotError, RaftError};
+use openraft::impls::BasicNode;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use openraft::{LogId, Raft};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::{NodeId, TypeConfig};
+use crate::kv::WriteOp;
+use crate::protocol::Reply;
 
 /// 长度前缀占用的字节数。
 const LENGTH_PREFIX_BYTES: usize = 4;
@@ -49,7 +63,29 @@ pub enum RpcRequest {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     /// 传输一个快照分片。
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+
+    // ---- 以下两个变体服务于「客户端连到非主节点」的场景，见模块文档 ----
+    /// 把一条写操作交给对方提交。
+    ///
+    /// 只有主节点能把条目写进日志，因此接收到本请求的节点若不是主节点，会如实拒绝
+    /// 并告知真正的主节点是谁——**绝不自作主张地代为提交**。
+    ClientWrite(WriteOp),
+    /// 请求对方确认领导权，并给出一个可用于线性一致读的日志索引。
+    ///
+    /// 收到响应的节点只需等待自己的状态机追平到该索引，便可在**本地**完成读取。
+    /// 这样读操作不必把数据搬来搬去，也避免了把客户端命令塞进节点间的消息里。
+    ReadIndex,
 }
+
+/// 一次转发写入的处理结果。
+///
+/// 单独起别名是因为 openraft 的错误类型参数很长，而这里刻意**保留**了完整的错误
+/// 结构而不是压成字符串（原因见 [`RpcResponse`] 的说明）。
+pub type ClientWriteResult = Result<Reply, RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>>;
+
+/// 一次读索引请求的处理结果。
+pub type ReadIndexResult =
+    Result<Option<LogId<NodeId>>, RaftError<NodeId, CheckIsLeaderError<NodeId, BasicNode>>>;
 
 /// 一次 RPC 的响应。
 ///
@@ -62,6 +98,15 @@ pub enum RpcResponse {
     InstallSnapshot(
         Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>,
     ),
+
+    /// 对方对写操作的处理结果。
+    ///
+    /// 这里保留了完整的 [`ClientWriteError`] 而不压成字符串，是因为发起方必须能区分
+    /// 「对方不是主节点，这次写入肯定没生效」（可以安全重试）与「结果不确定」
+    /// （重试可能重复执行一条 `INCR`）。压成字符串这个区别就丢了。
+    ClientWrite(ClientWriteResult),
+    /// 对方对读索引请求的处理结果。
+    ReadIndex(ReadIndexResult),
 }
 
 /// 写入一帧消息。
@@ -156,7 +201,12 @@ async fn handle_connection(mut stream: TcpStream, raft: Raft<TypeConfig>) -> std
 ///
 /// 这里**不设置超时**：处理入站 RPC 只是把消息投递给本地的 Raft 状态机，
 /// 不涉及网络等待。真正的超时应当由发起方（客户端侧）控制。
-async fn dispatch(raft: &Raft<TypeConfig>, request: RpcRequest) -> RpcResponse {
+///
+/// 本函数同时被两处使用：RPC 服务端（处理来自其他节点的请求），以及
+/// [`crate::raft::forward`] 的本地快路径（本节点恰好是主节点时直接在这里提交，
+/// 不必绕网络一圈）。两处共用同一个实现，就不会出现「本地提交与服务端提交行为不一致」
+/// 这类只在集群里才暴露的缺陷。
+pub async fn dispatch(raft: &Raft<TypeConfig>, request: RpcRequest) -> RpcResponse {
     match request {
         RpcRequest::Vote(request) => RpcResponse::Vote(raft.vote(request).await),
         RpcRequest::AppendEntries(request) => {
@@ -165,6 +215,14 @@ async fn dispatch(raft: &Raft<TypeConfig>, request: RpcRequest) -> RpcResponse {
         RpcRequest::InstallSnapshot(request) => {
             RpcResponse::InstallSnapshot(raft.install_snapshot(request).await)
         }
+        // 客户端写入。openraft 的响应里只有 `data` 是我们关心的（即状态机返回的
+        // `Reply`）；日志位置等信息对转发方没有意义。
+        RpcRequest::ClientWrite(op) => {
+            RpcResponse::ClientWrite(raft.client_write(op).await.map(|response| response.data))
+        }
+        // 线性一致读的第一步。`ensure_linearizable` 返回的是**状态机应当追平到的
+        // 日志位置**——本节点此时已经追平，而发起方拿它去等自己的状态机。
+        RpcRequest::ReadIndex => RpcResponse::ReadIndex(raft.ensure_linearizable().await),
     }
 }
 

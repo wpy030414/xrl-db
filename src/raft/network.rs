@@ -205,14 +205,9 @@ impl NetworkFactory {
     /// [`crate::config::RPC_PORT_OFFSET`]。推导失败的节点会被跳过——配置校验
     /// 早已拦下这种情况，这里只是不让一个坏地址拖垮整个工厂。
     pub fn new(config: &Config) -> Self {
-        let members = config
-            .cluster
-            .peers
-            .iter()
-            .filter_map(|peer| config.peer_rpc_addr(peer.id).map(|addr| (peer.id, addr)))
-            .collect();
-
-        Self { members }
+        Self {
+            members: config.peer_rpc_addrs(),
+        }
     }
 }
 

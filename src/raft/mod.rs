@@ -15,6 +15,9 @@
 //! | `RaftSnapshotBuilder` | 生成快照 | [`state_machine`] |
 //! | `RaftNetwork` / `RaftNetworkFactory` | 节点间 RPC | [`network`] |
 //!
+//! 此外还有一项 openraft 不管、但任何可用的集群都必须自己解决的事情：
+//! **客户端连到了非主节点怎么办**。解决方案见 [`forward`]。
+//!
 //! # 正确性从哪来
 //!
 //! Raft 最危险的失败模式不是「跑不起来」，而是「跑得起来但偶发静默丢数据」——这类
@@ -24,6 +27,7 @@
 //! `openraft::testing::Suite::test_all`：跑通即证明存储实现满足 Raft 协议对存储的
 //! 全部要求。这是选择 openraft 而非手写 Raft 的核心理由。
 
+pub mod forward;
 pub mod log_store;
 pub mod network;
 pub mod rpc;
