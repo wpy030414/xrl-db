@@ -15,6 +15,7 @@ use std::fmt;
 
 use bytes::Bytes;
 use redis_protocol::resp3::types::BytesFrame;
+use serde::{Deserialize, Serialize};
 
 /// 一条解析完成的客户端命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +112,7 @@ pub enum SetExpire {
 }
 
 /// `SET` 的存在性条件。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SetCondition {
     /// 无条件写入
     #[default]

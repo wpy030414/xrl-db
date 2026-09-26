@@ -20,7 +20,7 @@ pub mod op;
 pub mod store;
 
 pub use op::{TimestampMs, WriteOp};
-pub use store::Store;
+pub use store::{SnapshotEntry, Store};
 
 /// 当前时刻，单位毫秒（Unix 纪元）。
 ///

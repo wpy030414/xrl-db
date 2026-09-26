@@ -18,6 +18,7 @@
 //! 误用相对时间的可能。
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Command, CommandError, SetCondition};
 
@@ -28,7 +29,10 @@ pub type TimestampMs = u64;
 ///
 /// 与 [`Command`] 的关键区别：**所有时间都是绝对时刻**，不含任何需要读取时钟才能
 /// 解释的相对量。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 需要序列化是因为它会被写入 Raft 日志——**这正是「相对时间必须提前解析」的原因**：
+/// 日志一旦写下就不再改变，各副本读到的必定是同一个绝对时刻。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteOp {
     /// 写入一个键。
     ///

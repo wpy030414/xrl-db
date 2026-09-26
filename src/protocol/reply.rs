@@ -19,6 +19,7 @@ use bytes::Bytes;
 use redis_protocol::bytes_utils::Str;
 use redis_protocol::resp2::types::BytesFrame as Resp2Frame;
 use redis_protocol::resp3::types::BytesFrame as Resp3Frame;
+use serde::{Deserialize, Serialize};
 
 /// 客户端当前使用的协议方言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -31,7 +32,10 @@ pub enum Dialect {
 }
 
 /// 一条待发送给客户端的响应，与方言无关。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 需要序列化是因为它会作为 [`RaftTypeConfig`](crate::raft::TypeConfig) 的响应类型，
+/// 由共识层在网络上传送。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     /// 简单字符串，如 `+OK`
     Simple(String),

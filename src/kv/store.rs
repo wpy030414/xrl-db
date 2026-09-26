@@ -19,6 +19,11 @@ use super::glob;
 use super::op::{TimestampMs, WriteOp};
 use crate::protocol::{Reply, SetCondition};
 
+/// 快照中的一条记录：`(键, 值, 过期时刻)`。
+///
+/// 与 [`Entry`] 的区别是它是公开的、可序列化的形态——快照需要跨进程传递。
+pub type SnapshotEntry = (Bytes, Bytes, Option<TimestampMs>);
+
 /// 一条键值记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
@@ -60,6 +65,34 @@ impl Store {
     /// 状态机是否为空（含已过期但尚未回收的记录）。
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    // ------------------------------------------------------------ 快照
+
+    /// 导出全部记录，用于生成快照。
+    ///
+    /// **包含已过期的记录。** 这样快照就是「已应用日志」的纯函数，不依赖生成快照
+    /// 那一刻的时钟——两个副本即使在不同时刻生成快照，内容也完全一致。
+    /// 已过期的记录在读取路径上依然不可见，不影响正确性。
+    ///
+    /// 结果按键排序：内部是 `HashMap`，迭代顺序本不稳定，排序后同一串已应用日志
+    /// 必然产出**逐字节相同**的快照，便于比对与排查。
+    pub fn export(&self) -> Vec<SnapshotEntry> {
+        let mut entries: Vec<SnapshotEntry> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.value.clone(), entry.expire_at))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// 用快照内容**整体替换**当前状态。
+    pub fn restore(&mut self, entries: Vec<SnapshotEntry>) {
+        self.entries = entries
+            .into_iter()
+            .map(|(key, value, expire_at)| (key, Entry { value, expire_at }))
+            .collect();
     }
 
     // ---------------------------------------------------------------- 写入口

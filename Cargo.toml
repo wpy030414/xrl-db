@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
-openraft = "0.9"
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 redb = "4"
 redis-protocol = { version = "6.0.0", features = ["codec", "bytes"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -17,4 +18,5 @@ toml = "1"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3.27.0"
 turmoil = "0.7"
