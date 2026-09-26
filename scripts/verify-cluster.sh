@@ -212,11 +212,35 @@ else
   bad "向新主节点 $NEW_LEADER 写入失败：$result"
 fi
 
-step "6. 只留主节点一个，确认它拒绝写入（CP 语义）"
+step "6. 整组重启（同一份数据目录），确认数据仍然可读"
+# 这一步同时锁住一个真实修过的缺陷：引导节点若把「已经初始化过」当成启动失败，
+# 那么**只要集群落过盘，它就再也起不来了**——而报错只会说「不允许初始化」，
+# 与真正的原因相距甚远。
+"$ROOT/scripts/cluster-down.sh" >/dev/null 2>&1 || true
+"$ROOT/scripts/cluster-up.sh" >/dev/null 2>&1 || die "整组重启失败"
+
+RESTARTED_LEADER="$(wait_for_leader "$LEADER_TIMEOUT")" || die "重启后等不到主节点"
+ok "三个节点用同一份数据目录重启成功，主节点是 $RESTARTED_LEADER"
+
+# 数据必须原样还在——包括重启之前写入的那 100 个键
+missing_after_restart=0
+for i in $(seq 1 "$KEY_COUNT"); do
+  if [ "$i" -le "$half" ]; then key="leader-$i"; else key="follower-$i"; fi
+  got="$(cli 10 -p "$(port_of "$RESTARTED_LEADER")" --raw GET "$key")"
+  [ "$got" = "value-$i" ] || missing_after_restart=$((missing_after_restart + 1))
+done
+
+if [ "$missing_after_restart" -eq 0 ]; then
+  ok "整组重启后 $KEY_COUNT 个键仍然全部可读"
+else
+  bad "整组重启后有 $missing_after_restart 个键读不到了"
+fi
+
+step "7. 只留主节点一个，确认它拒绝写入（CP 语义）"
 # 刻意让**主节点**成为唯一的幸存者：它失去了多数派，却仍以为自己是主节点。
 # 这正是一开始那个「写入永远挂住、客户端拿不到任何回复」的场景——把从节点留下
 # 来测是测不到的，从节点会立刻回一句「没有主节点」。
-CURRENT_LEADER="$(wait_for_leader "$LEADER_TIMEOUT")" || die "步骤 6 前找不到主节点"
+CURRENT_LEADER="$(wait_for_leader "$LEADER_TIMEOUT")" || die "步骤 7 前找不到主节点"
 SURVIVOR="$CURRENT_LEADER"
 log "  幸存者选定为当前主节点 $SURVIVOR"
 

@@ -40,6 +40,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use super::{NodeId, TypeConfig};
 use crate::kv::WriteOp;
@@ -163,9 +164,25 @@ fn invalid_data(error: postcard::Error) -> std::io::Error {
 /// 在一个已绑定的监听器上接受来自其他节点的 RPC 连接。
 ///
 /// 每条连接独立成任务，且会持续复用（openraft 会反复向同一对端发起 RPC）。
-pub async fn serve(listener: TcpListener, raft: Raft<TypeConfig>) -> std::io::Result<()> {
+///
+/// # 为什么要一个停止信号
+///
+/// 这个循环持有监听器不放。如果它只在进程退出时才结束，那么**关闭一个节点并不会
+/// 释放它的端口**——同一个进程里重启这个节点会直接失败在「地址已被占用」上，
+/// 而那个端口其实属于一个已经被「关掉」的节点。它还会一直握着一份 `Raft` 引用，
+/// 让整个共识实例连同 redb 的文件锁都无法释放。
+pub async fn serve(
+    listener: TcpListener,
+    raft: Raft<TypeConfig>,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+
+            // 收到停止信号：立刻交出监听器，让端口可以被重新绑定
+            _ = shutdown.changed() => return Ok(()),
+        };
 
         // 节点间消息同样是小包往返，禁用 Nagle 降低选举与心跳的延迟
         if let Err(error) = stream.set_nodelay(true) {

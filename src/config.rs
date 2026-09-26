@@ -105,16 +105,6 @@ pub struct StorageConfig {
     pub path: Option<PathBuf>,
 }
 
-/// Raft 共识调参。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RaftConfig {
-    /// 选举超时（毫秒）。follower 超过此时长未收到心跳即发起选举。
-    pub election_timeout_ms: u64,
-    /// 心跳间隔（毫秒）。leader 按此频率向 follower 发送心跳。
-    pub heartbeat_interval_ms: u64,
-}
-
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -125,12 +115,40 @@ impl Default for NodeConfig {
     }
 }
 
+/// Raft 共识调参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RaftConfig {
+    /// 选举超时（毫秒）。follower 超过此时长未收到心跳即发起选举。
+    pub election_timeout_ms: u64,
+    /// 心跳间隔（毫秒）。leader 按此频率向 follower 发送心跳。
+    pub heartbeat_interval_ms: u64,
+    /// 距上一次快照累积多少条日志之后触发一次快照。
+    ///
+    /// 这个值直接决定了**日志占用的磁盘上限**。日志是只能靠快照来截断的：
+    /// 只有已经被纳入快照的那部分才允许删除，否则一个落后的从节点就没法靠日志
+    /// 追上来了。所以没有快照就等于日志无限增长，磁盘迟早被吃满——这不是一个
+    /// 性能选项，而是能不能长期运行的问题。
+    ///
+    /// 调小会让快照更频繁（每次压力更小，但总开销更大），调大则相反。
+    pub snapshot_logs_since_last: u64,
+    /// 快照之外还要保留多少条日志。
+    ///
+    /// 快照建好之后立刻把日志删干净是最省空间的，但那会让「只落后一点点」的从节点
+    /// 也不得不接收整个快照——那份快照可能是几百兆。留一段日志，多数追赶就仍然
+    /// 只是一次普通的日志复制。
+    pub max_in_snapshot_log_to_keep: u64,
+}
+
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             // 默认比值为 3，与 openraft 的默认配置一致
             election_timeout_ms: 300,
             heartbeat_interval_ms: 100,
+            // 与 openraft 的默认值一致：这两个数在它的文档里是被反复使用过的组合
+            snapshot_logs_since_last: 5_000,
+            max_in_snapshot_log_to_keep: 1_000,
         }
     }
 }
@@ -201,6 +219,16 @@ impl Config {
                  否则 follower 会在收到心跳前超时，导致集群无法稳定选出 leader",
                 self.raft.election_timeout_ms, self.raft.heartbeat_interval_ms
             )));
+        }
+
+        // 0 意味着「每一条日志都要建一次快照」，日志永远追不上快照。这不像是有人
+        // 会主动选的参数，更可能是配错了。
+        if self.raft.snapshot_logs_since_last == 0 {
+            return Err(Error::ConfigInvalid(
+                "raft.snapshot_logs_since_last 不能为 0；\
+                 它会让每一条日志都触发一次快照，等于把快照当成了日志写"
+                    .to_string(),
+            ));
         }
 
         if !self.cluster.enabled {
@@ -417,6 +445,12 @@ fn parse_line_config(text: &str, path: &Path) -> Result<Config> {
             "cluster-heartbeat-interval-ms" => {
                 config.raft.heartbeat_interval_ms = parse_u64(first, key, path, line_no)?;
             }
+            "cluster-snapshot-logs-since-last" => {
+                config.raft.snapshot_logs_since_last = parse_u64(first, key, path, line_no)?;
+            }
+            "cluster-max-in-snapshot-log-to-keep" => {
+                config.raft.max_in_snapshot_log_to_keep = parse_u64(first, key, path, line_no)?;
+            }
             other => {
                 return Err(Error::ConfigLine {
                     path: path.to_path_buf(),
@@ -512,6 +546,8 @@ path = "./data/node2"
 [raft]
 election_timeout_ms = 300
 heartbeat_interval_ms = 100
+snapshot_logs_since_last = 5000
+max_in_snapshot_log_to_keep = 1000
 "#;
 
     /// 等价的 redis.conf 风格配置
@@ -529,6 +565,8 @@ cluster-peer 3 127.0.0.1:7003
 
 cluster-election-timeout-ms 300
 cluster-heartbeat-interval-ms 100
+cluster-snapshot-logs-since-last 5000
+cluster-max-in-snapshot-log-to-keep 1000
 "#;
 
     /// 把字符串按 TOML 解析
@@ -552,6 +590,8 @@ cluster-heartbeat-interval-ms 100
         assert_eq!(cfg.cluster.peers.len(), 3);
         assert_eq!(cfg.raft.election_timeout_ms, 300);
         assert_eq!(cfg.raft.heartbeat_interval_ms, 100);
+        assert_eq!(cfg.raft.snapshot_logs_since_last, 5000);
+        assert_eq!(cfg.raft.max_in_snapshot_log_to_keep, 1000);
     }
 
     #[test]

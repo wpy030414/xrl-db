@@ -18,9 +18,12 @@ use std::sync::Arc;
 
 use openraft::error::{ClientWriteError, Fatal, InitializeError, RaftError};
 use openraft::impls::BasicNode;
-use openraft::{ChangeMembers, Config as RaftConfig, Raft, RaftMetrics, StorageError};
+use openraft::{
+    ChangeMembers, Config as RaftConfig, Raft, RaftMetrics, SnapshotPolicy, StorageError,
+};
 use redb::Database;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::kv::{Store, WriteOp};
@@ -154,6 +157,13 @@ pub struct Node {
     /// 有了它，客户端连到任何一个节点都能读写——这正是相对 Redis Cluster 的
     /// 额外卖点：Redis 需要客户端自己实现槽位路由，我们不需要。
     forwarder: Forwarder,
+    /// 节点间 RPC 服务的停止信号。
+    rpc_stop: watch::Sender<bool>,
+    /// 节点间 RPC 服务的任务句柄。
+    ///
+    /// 用 `Mutex` 包一层只是为了让 [`Node::shutdown`] 能取 `&self` 的同时把句柄
+    /// 拿走——关闭动作本身不需要独占整个节点。
+    rpc_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Node {
@@ -209,10 +219,12 @@ impl Node {
         .await
         .map_err(NodeError::Startup)?;
 
-        // RPC 服务在后台运行，随进程结束而结束
+        // RPC 服务在后台运行，随进程结束而结束；但要留下停止信号与句柄，
+        // 让「关闭这个节点」能真正把端口和 Raft 引用交还出来（见 Node::shutdown）。
+        let (rpc_stop, rpc_stopped) = watch::channel(false);
         let rpc_raft = raft.clone();
-        tokio::spawn(async move {
-            if let Err(error) = rpc::serve(listener, rpc_raft).await {
+        let rpc_task = tokio::spawn(async move {
+            if let Err(error) = rpc::serve(listener, rpc_raft, rpc_stopped).await {
                 eprintln!("节点间 RPC 服务已停止：{error}");
             }
         });
@@ -225,6 +237,8 @@ impl Node {
             rpc_addr,
             state_machine: read_handle,
             forwarder,
+            rpc_stop,
+            rpc_task: std::sync::Mutex::new(Some(rpc_task)),
         })
     }
 
@@ -234,6 +248,15 @@ impl Node {
     /// 只有成员数量之差，不存在两套代码路径——也就不会出现「单机测试全过、
     /// 一上集群就出问题」这类最难排查的缺陷。
     ///
+    /// # 对已经初始化过的数据目录是幂等的
+    ///
+    /// 数据目录里已经有日志时，`initialize` 会被 openraft 拒绝——这是**保护**而非
+    /// 缺陷：重新初始化会丢弃既有日志。但「重启一个既有节点」是最普通的运维操作，
+    /// 若把它当成启动失败，那么**只要集群落过盘，它就再也起不来了**，而且
+    /// 报错只说「不允许初始化」，与真正的原因相距甚远。
+    ///
+    /// 因此这里把「已经初始化过」单独识别出来，沿用它已有的成员配置继续启动。
+    ///
     /// 返回时保证主节点已经选出：选举是异步的，不等它完成就会打印出
     /// 「尚未选出主节点」这种自相矛盾的启动信息。
     pub async fn start_single(config: Config) -> Result<Self, NodeError> {
@@ -241,7 +264,14 @@ impl Node {
 
         let mut members = BTreeMap::new();
         members.insert(node.id, BasicNode::new(node.rpc_addr.to_string()));
-        node.initialize(members).await?;
+
+        match node.initialize(members).await {
+            Ok(()) => {}
+            // 数据目录里已经有日志与成员配置——重启，不是首次启动。
+            // 已有的成员配置就在磁盘上，openraft 自己会恢复它。
+            Err(NodeError::Initialize(RaftError::APIError(InitializeError::NotAllowed(_)))) => {}
+            Err(error) => return Err(error),
+        }
 
         // 单节点集群的选举几乎是瞬时的，但仍然是异步的，必须显式等待。
         // 超时不作为启动失败——集群可能只是慢了一点，稍后会自行恢复。
@@ -455,7 +485,28 @@ impl Node {
     ///
     /// 取 `&self` 而非 `self`，是为了让调用方不必从 `Arc` 里解包——`Raft` 句柄
     /// 本身是可克隆的，底层的关闭动作并不需要独占所有权。
+    ///
+    /// # 关闭必须真的把东西交还出去
+    ///
+    /// 只调用 `Raft::shutdown` 是不够的：节点间 RPC 的服务循环持有监听器，也持有
+    /// 一份 `Raft` 引用。它如果一直跑到进程结束，那么「已关闭」的节点会
+    /// **仍然占着端口、仍然拖着整个共识实例和 redb 的文件锁**——
+    /// 同一个进程里重启这个节点就会失败在「地址已被占用」或「数据库已被打开」上，
+    /// 而错误信息指向的东西看起来完全正常。
     pub async fn shutdown(&self) {
+        // 先让 RPC 服务交还监听器。顺序不能反：等 Raft 都关完了再停 RPC，
+        // 那段窗口里服务循环可能正拿着一个已经失效的 Raft 去处理请求。
+        let _ = self.rpc_stop.send(true);
+
+        let handle = {
+            let mut slot = self.rpc_task.lock().expect("RPC 任务句柄的锁不应被毒化");
+            slot.take()
+        };
+        if let Some(handle) = handle {
+            // 等它真正退出，而不是只看信号已经发出——端口是在它退出的那一刻才释放的
+            let _ = handle.await;
+        }
+
         if let Err(error) = self.raft.shutdown().await {
             eprintln!("节点 {} 关闭时出错：{error}", self.id);
         }
@@ -491,14 +542,44 @@ pub fn state_name(state: openraft::ServerState) -> &'static str {
 
 /// 依据项目配置构造 openraft 的运行时配置。
 fn build_raft_config(config: &Config) -> RaftConfig {
+    let raft = &config.raft;
+
+    // 落后多少条日志就该改传快照而不是继续补日志。
+    //
+    // 取「两次快照之间的日志量 + 快照之外保留的日志量」：一个从节点若能靠现有日志
+    // 追上，它落后的量必然落在这个范围内；超出它，说明它要的那段日志已经被截断了，
+    // 只能给它整个快照。openraft 自己的默认值是 5000，这里取两者的较大值，
+    // 免得把 tuning 过的参数反而调小了。
+    let replication_lag_threshold = raft
+        .snapshot_logs_since_last
+        .saturating_add(raft.max_in_snapshot_log_to_keep)
+        .max(DEFAULT_REPLICATION_LAG_THRESHOLD);
+
     RaftConfig {
         cluster_name: format!("xrl-db-{}", config.node.id),
-        heartbeat_interval: config.raft.heartbeat_interval_ms,
+        heartbeat_interval: raft.heartbeat_interval_ms,
         // 选举超时给一个区间：所有节点若用完全相同的超时，会在 leader 失联后
         // 同时发起选举、反复分裂选票而选不出新 leader。openraft 会在区间内随机
         // 取值来打破这种对称。
-        election_timeout_min: config.raft.election_timeout_ms,
-        election_timeout_max: config.raft.election_timeout_ms * 2,
+        election_timeout_min: raft.election_timeout_ms,
+        election_timeout_max: raft.election_timeout_ms * 2,
+
+        // ---- 快照与日志截断 ----
+        //
+        // 不配这一段，日志就会无限增长，磁盘迟早被吃满。截断的唯一依据是快照，
+        // 因此「多久建一次快照」实际上就是「日志能占多大磁盘」。
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(raft.snapshot_logs_since_last),
+        max_in_snapshot_log_to_keep: raft.max_in_snapshot_log_to_keep,
+        // 每次最多删一条。批量删看起来更快，但删除发生在提交路径上——
+        // 一次删一大批会让某次写入的延迟突然多出几十毫秒。平滑更重要。
+        purge_batch_size: 1,
+        replication_lag_threshold,
+
         ..Default::default()
     }
 }
+
+/// 落后多少条日志才改用快照追赶的默认阈值。
+///
+/// 与 openraft 的默认值保持一致。
+const DEFAULT_REPLICATION_LAG_THRESHOLD: u64 = 5_000;

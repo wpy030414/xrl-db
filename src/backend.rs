@@ -320,6 +320,16 @@ impl Backend {
             (Reply::bulk("members"), Reply::Integer(voters.len() as i64)),
             (Reply::bulk("voters"), Reply::bulk(voter_list)),
             (Reply::bulk("learners"), Reply::Integer(learners as i64)),
+            // 快照与日志截断的进度。没有这两项，运维就无法回答「日志会不会把磁盘
+            // 吃满」这个问题——而那正是没有快照时必然会发生的事。
+            (
+                Reply::bulk("snapshot_index"),
+                Reply::Integer(metrics.snapshot.map(|id| id.index as i64).unwrap_or(0)),
+            ),
+            (
+                Reply::bulk("purged_index"),
+                Reply::Integer(metrics.purged.map(|id| id.index as i64).unwrap_or(0)),
+            ),
         ])
     }
 

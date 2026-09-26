@@ -295,6 +295,9 @@ fn build_config(id: u64, addrs: &[(u64, SocketAddr)], data_dir: std::path::PathB
             // 调快一些让测试不必等太久；生产默认值更保守
             election_timeout_ms: 300,
             heartbeat_interval_ms: 100,
+            // 快照与截断策略沿用默认值——这一组测试关心的是集群行为，
+            // 快照由 tests/snapshot.rs 专门盯着
+            ..Default::default()
         },
     };
 
