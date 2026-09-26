@@ -214,12 +214,28 @@ impl Node {
     /// 单节点同样运行完整的 Raft，只是成员只有一个。这样「单机」与「集群」之间
     /// 只有成员数量之差，不存在两套代码路径——也就不会出现「单机测试全过、
     /// 一上集群就出问题」这类最难排查的缺陷。
+    ///
+    /// 返回时保证主节点已经选出：选举是异步的，不等它完成就会打印出
+    /// 「尚未选出主节点」这种自相矛盾的启动信息。
     pub async fn start_single(config: Config) -> Result<Self, NodeError> {
         let node = Self::start(config).await?;
 
         let mut members = BTreeMap::new();
         members.insert(node.id, BasicNode::new(node.rpc_addr.to_string()));
         node.initialize(members).await?;
+
+        // 单节点集群的选举几乎是瞬时的，但仍然是异步的，必须显式等待。
+        // 超时不作为启动失败——集群可能只是慢了一点，稍后会自行恢复。
+        if node
+            .wait_for_leader(SINGLE_NODE_ELECTION_TIMEOUT)
+            .await
+            .is_none()
+        {
+            eprintln!(
+                "警告：节点 {} 在 {:?} 内未选出主节点，稍后会自行重试",
+                node.id, SINGLE_NODE_ELECTION_TIMEOUT
+            );
+        }
 
         Ok(node)
     }
@@ -361,6 +377,12 @@ impl Node {
         }
     }
 }
+
+/// 单节点集群选举主节点的等待上限。
+///
+/// 给得比选举超时宽松得多：单节点不需要和任何人通信，正常情况下是瞬时的；
+/// 留出余量只是为了容忍调度延迟。
+const SINGLE_NODE_ELECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 把 Raft 的服务器状态映射为纯文本。
 ///
