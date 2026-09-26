@@ -42,6 +42,8 @@
 5. **openraft 一律以 0.9 的 API 为准**。0.9 已把旧的单一 `RaftStorage` 拆成 `RaftLogStorage` + `RaftStateMachine` 两个 trait，网上大量教程（含官方 getting-started 页）仍是 0.8 旧 API，**照抄会编译不过**。
 6. **「结果未知」不得被改写成「失败」或「成功」**。一次写入在请求发出之后失败时，无法判断它是否已经生效。任何把它当作确定结果来处理的改动——尤其是「失败就重试」——都可能让一条 `INCR` 被执行两次。修改 `src/raft/forward.rs` 之前先读它的模块文档。
 7. **失去多数派时必须拒绝服务，且必须在限时内拒绝**。降级为读本地、或让请求无限挂起，都是比不可用更糟的结果：前者返回过期数据，后者让调用方无从判断该不该重试。
+8. **依赖清单里声明的每一项都必须真的在用**。一个从不被使用的依赖会持续暗示「这类测试已经做过了」，而实际上没有——`proptest` 与 `turmoil` 就这样空挂了很久，直到有人去核对。要么用起来，要么删掉并说明理由（见 ADR-016）。
+9. **转发路径上的退避只能用在「没能送达」上**。「跟着 `ForwardToLeader` 给出的提示去访问主节点」是执行一个确定要做的动作，不是重试；为它退避一次会让从节点上的每一次读写都固定多花一个 `RETRY_DELAY`。这类缺陷不会让任何断言变红，只会让「客户端连任意节点都能读写」这个卖点变得难以忍受（见 ADR-017）。
 
 ### 代码风格
 
@@ -58,6 +60,22 @@
 - **redb 是单进程的**（文件锁，重复打开会返回 `DatabaseAlreadyOpen`）。任何多节点测试必须给每个节点**独立目录**，绝不能共享同一个 redb 文件。
 - 存储实现必须先通过 `openraft::testing::Suite::test_all`，再接入网络层。
 - 测试失败必须以非零退出码结束。
+- **端口分配与配置构造一律走 `tests/common/`**，不要在测试文件里各写一份。这段代码写错的症状是测试随机失败，而随机失败的测试比没有测试更糟——它会耗尽对整套测试的信任。
+- **新加的断言必须先被弄红一次**。把断言该抓的东西在代码里破坏掉，确认测试真的失败，再改回来。没被撞红过的断言不算证据——`tests/codec_props.rs` 与 `tests/partition.rs` 的关键断言都做过这个对照，过程记在各自的模块文档里。
+- **正确性之外的量级也要盯**。延迟、日志留存这类退化不会让任何断言变红，只会让功能悄悄变得不可用。它们需要专门的测试（如 `tests/cluster.rs::a_follower_does_not_pay_a_retry_delay` 比中位耗时），而且阈值要离正常值与缺陷值都足够远。
+
+各测试文件各自盯住什么：
+
+| 文件 | 盯住的东西 |
+|---|---|
+| `tests/server.rs` | 原始 RESP 字节层的协议行为（方言、流水线、二进制安全） |
+| `tests/codec_props.rs` | 编解码层的**性质**：分包不变性、不崩溃不空转、二进制安全 |
+| `tests/raft_storage.rs` | 存储实现符合 Raft 协议要求（`Suite::test_all`） |
+| `tests/raft_persistence.rs` | 落盘与重启恢复 |
+| `tests/cluster.rs` | 集群行为：选举、故障转移、转发、失去多数派、转发的延迟量级 |
+| `tests/snapshot.rs` | 快照触发与日志截断（单机） |
+| `tests/snapshot_replication.rs` | 快照**经过网络**装到落后的节点上 |
+| `tests/partition.rs` | **非对称网络分区**（每条有向边独立开关） |
 
 ## 目录速查
 
@@ -74,5 +92,5 @@
 | `src/kv/` | 键值数据模型、TTL、可复制的写操作 `WriteOp` |
 | `docs/` | 项目文档（见 README 的文档索引） |
 | `docs/specs/` | 各模块详细规格，随模块实现逐步填充 |
-| `scripts/` | 集群启停与端到端验收脚本（`verify-cluster.sh` 用真实 `kill -9`） |
-| `tests/` | 集成测试：`cluster.rs` 集群、`snapshot.rs` 截断、`raft_storage.rs` 协议套件、`server.rs` 原始 RESP 字节 |
+| `scripts/` | 集群启停（`cluster-up.sh` / `cluster-down.sh`）、端到端验收（`verify-cluster.sh`，用真实 `kill -9`）、性能压测（`bench.sh`） |
+| `tests/` | 集成测试，各文件的分工见下方「测试约定」的表；共用脚手架在 `tests/common/` |
