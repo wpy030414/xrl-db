@@ -12,7 +12,7 @@
 
 ### 范围内
 
-- Redis RESP3 协议兼容（自研编解码，零拷贝解析）
+- Redis RESP3 协议兼容（基于 `redis-protocol` 的 codec 模块 + tokio-util `Framed`）
 - 单 Raft 组强一致性（openraft + redb）
 - String 类型命令（见 PRD 的命令清单）
 - 写请求在 follower 上透明转发到 leader

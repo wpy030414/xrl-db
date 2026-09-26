@@ -55,7 +55,7 @@
 | `config.rs` | 读取并校验配置；把 TOML 与 `redis.conf` 两种格式归一到同一个强类型 `Config` |
 | `error.rs` | 全局统一错误类型，供各层共享 |
 | `node.rs` | 节点协调者：按依赖顺序拼装存储、Raft、网络，处理启动与优雅关闭 |
-| `protocol/resp.rs` | RESP3 编解码。零拷贝解析——直接借用输入缓冲的 `&[u8]`，避免 String 分配 |
+| `protocol/resp.rs` | RESP3 编解码。基于 `redis-protocol` 的 `codec` 模块（其自身为零拷贝）配合 tokio-util 的 `Framed` 组织 I/O |
 | `protocol/command.rs` | 把 RESP3 的值解析为强类型 `Command` 枚举，并做参数校验 |
 | `server/listener.rs` | TCP 监听与连接生命周期管理 |
 | `server/session.rs` | 单连接会话：读命令 → 分发 → 写回结果 |
@@ -157,6 +157,7 @@ state_machine 应用该条目 ──► kv/store 写入 → redb
 | 系统 | 关系 |
 |---|---|
 | Redis 客户端 | 通过 RESP3 协议连接。本项目的兼容性以官方 `redis-cli` 为准 |
+| `redis-protocol` | 提供 RESP3 编解码实现。本项目使用其 `codec` 模块，不自研协议层（见 ADR-011） |
 | openraft | 提供 Raft 共识实现。本项目实现其存储 trait 并接入网络层 |
 | redb | 提供本地事务性存储。本项目在其上建两张表：Raft 日志、KV 状态机 |
 

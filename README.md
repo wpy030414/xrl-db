@@ -73,7 +73,7 @@ OK
 | 领域 | 选型 |
 |---|---|
 | 语言 | Rust（edition 2024） |
-| 网络协议 | Redis RESP3 兼容（自研编解码） |
+| 网络协议 | Redis RESP3 兼容（基于 `redis-protocol` codec） |
 | 共识 | openraft（单 Raft 组，强一致 CP） |
 | 存储 | redb（纯 Rust、ACID、快照隔离） |
 | 异步运行时 | tokio |
